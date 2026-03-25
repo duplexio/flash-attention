@@ -244,3 +244,24 @@ class BlockInfo:
         if const_expr(self.qhead_per_kvhead_packgqa > 1):
             first_q = first_q * self.qhead_per_kvhead_packgqa
         return first_q // self.tile_m
+
+    @cute.jit
+    def get_m_block_max_release_mask_window(
+        self,
+        mReleaseMaskK: cute.Tensor,
+        seqlen_info: SeqlenInfoQK,
+        n_block: Int32,
+        window_size_left: Int32,
+    ) -> Int32:
+        """For backward with window: last Q tile that can still see this KV tile.
+
+        Q position i sees KV position j iff release_mask[i] - window_size_left <= j.
+        The first Q where the window has moved past j is release_mask_k[j + window_size_left].
+        Reuses release_mask_k with a shifted index — no new precomputation.
+        """
+        kv_end = cutlass.min((n_block + 1) * self.tile_n - 1, seqlen_info.seqlen_k - 1)
+        shifted = cutlass.min(kv_end + window_size_left, seqlen_info.seqlen_k - 1)
+        last_q = mReleaseMaskK[seqlen_info.offset_k + shifted]
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            last_q = last_q * self.qhead_per_kvhead_packgqa
+        return cute.ceil_div(last_q, self.tile_m)

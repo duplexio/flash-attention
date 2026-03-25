@@ -435,6 +435,7 @@ class FlashAttentionBackwardSm80:
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
         softmax_scale_log2 = softmax_scale * math.log2(math.e)
+        window_size_left = Int32(window_size_left) if window_size_left is not None else None
         self.kernel(
             mQ,
             mK,
@@ -472,6 +473,7 @@ class FlashAttentionBackwardSm80:
             TileScheduler,
             mReleaseMask,
             mReleaseMaskK,
+            window_size_left,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -518,6 +520,7 @@ class FlashAttentionBackwardSm80:
         TileScheduler: cutlass.Constexpr[Callable],
         mReleaseMask: Optional[cute.Tensor] = None,
         mReleaseMaskK: Optional[cute.Tensor] = None,
+        window_size_left: Optional[Int32] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -551,6 +554,11 @@ class FlashAttentionBackwardSm80:
                 kv_idx = n_block * self.n_block_size
                 first_q = mReleaseMaskK[seqlen.offset_k + kv_idx]
                 m_block_min = max(first_q // self.m_block_size, m_block_min)
+                if cutlass.const_expr(window_size_left is not None):
+                    kv_end = cutlass.min((n_block + 1) * self.n_block_size - 1, seqlen.seqlen_k - 1)
+                    shifted = cutlass.min(kv_end + window_size_left, seqlen.seqlen_k - 1)
+                    last_q = mReleaseMaskK[seqlen.offset_k + shifted]
+                    m_block_max = cutlass.min(m_block_max, cute.ceil_div(last_q, self.m_block_size))
             # TODO: return early if m_block_max == 0
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -826,6 +834,7 @@ class FlashAttentionBackwardSm80:
             # Start processing of the first n-block.
             mask = AttentionMask(
                 self.m_block_size, self.n_block_size, seqlen,
+                window_size_left=window_size_left,
                 release_mask=mReleaseMask,
                 offset_q=seqlen.offset_q if cutlass.const_expr(self.has_release_mask) else 0,
             )

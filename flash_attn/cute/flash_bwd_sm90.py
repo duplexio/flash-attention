@@ -935,6 +935,13 @@ class FlashAttentionBackwardSm90:
                 else:
                     m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block)
                     m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
+                    if const_expr(block_info.window_size_left is not None):
+                        m_block_max = cutlass.min(
+                            m_block_max,
+                            block_info.get_m_block_max_release_mask_window(
+                                mReleaseMaskK, seqlen, n_block, block_info.window_size_left
+                            ),
+                        )
 
                 if const_expr(not self.use_block_sparsity):
                     total_m_block_cnt = m_block_max - m_block_min

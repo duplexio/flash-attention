@@ -1659,6 +1659,13 @@ class FlashAttentionBackwardSm100:
             else:
                 m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0])
                 m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
+                if const_expr(block_info.window_size_left is not None):
+                    m_block_max = cutlass.min(
+                        m_block_max,
+                        block_info.get_m_block_max_release_mask_window(
+                            mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0], block_info.window_size_left
+                        ),
+                    )
             head_idx_kv = head_idx // self.qhead_per_kvhead
 
             process_tile = (
@@ -1775,6 +1782,13 @@ class FlashAttentionBackwardSm100:
             else:
                 m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0])
                 m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
+                if const_expr(block_info.window_size_left is not None):
+                    m_block_max = cutlass.min(
+                        m_block_max,
+                        block_info.get_m_block_max_release_mask_window(
+                            mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0], block_info.window_size_left
+                        ),
+                    )
             head_idx_kv = head_idx // self.qhead_per_kvhead
             n_block_cta_group = n_block // self.cta_group_size
 
@@ -2386,6 +2400,13 @@ class FlashAttentionBackwardSm100:
             else:
                 m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0])
                 m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
+                if const_expr(block_info.window_size_left is not None):
+                    m_block_max = cutlass.min(
+                        m_block_max,
+                        block_info.get_m_block_max_release_mask_window(
+                            mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0], block_info.window_size_left
+                        ),
+                    )
 
             if const_expr(self.use_block_sparsity):
                 block_iter_count = get_total_q_block_count_bwd(
@@ -3005,6 +3026,13 @@ class FlashAttentionBackwardSm100:
             else:
                 m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0])
                 m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
+                if const_expr(block_info.window_size_left is not None):
+                    m_block_max = cutlass.min(
+                        m_block_max,
+                        block_info.get_m_block_max_release_mask_window(
+                            mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0], block_info.window_size_left
+                        ),
+                    )
             mask = AttentionMaskCls(seqlen, offset_q=seqlen.offset_q if const_expr(self.has_release_mask) else 0)
             n_block_for_cluster = n_block // self.cta_group_size
             # TODO: condition mask_seqlen
@@ -3513,6 +3541,13 @@ class FlashAttentionBackwardSm100:
             else:
                 m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block_cta_group)
                 m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
+                if const_expr(block_info.window_size_left is not None):
+                    m_block_max = cutlass.min(
+                        m_block_max,
+                        block_info.get_m_block_max_release_mask_window(
+                            mReleaseMaskK, seqlen, n_block_cta_group, block_info.window_size_left
+                        ),
+                    )
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
             else:
