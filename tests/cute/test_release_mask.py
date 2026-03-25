@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def attention_release_mask_ref(q, k, v, release_mask, softmax_scale=None):
+def attention_release_mask_ref(q, k, v, release_mask, softmax_scale=None, window_size_left=None):
     """Differentiable reference: materialize full mask, compute attention with autograd.
 
     All inputs must have requires_grad=True (for q, k, v) to get gradients.
@@ -40,8 +40,12 @@ def attention_release_mask_ref(q, k, v, release_mask, softmax_scale=None):
     scores = torch.einsum("qhd,khd->hqk", q.float() * softmax_scale, k_expanded.float())
 
     kv_idx = torch.arange(total_k, device=q.device).unsqueeze(0)
-    visible = release_mask.unsqueeze(1)
-    mask = kv_idx < visible
+    right = release_mask.unsqueeze(1)
+    if window_size_left is not None:
+        left = (release_mask - window_size_left).clamp(min=0).unsqueeze(1)
+        mask = (kv_idx >= left) & (kv_idx < right)
+    else:
+        mask = kv_idx < right
     scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
 
     attn = torch.softmax(scores, dim=-1)
@@ -50,12 +54,11 @@ def attention_release_mask_ref(q, k, v, release_mask, softmax_scale=None):
     return out.to(q.dtype), lse
 
 
-def generate_release_mask(seqlens_q, seqlens_k, device):
+def generate_release_mask(seqlens_q, seqlens_k, device, min_visible=0):
     """Generate a random monotonically non-decreasing release_mask."""
     parts = []
     for sq, sk in zip(seqlens_q, seqlens_k):
-        # Ensure at least some Q positions see some KV (avoid all-masked for gradient tests)
-        vals = torch.sort(torch.randint(0, sk + 1, (sq,), dtype=torch.int32, device=device))[0]
+        vals = torch.sort(torch.randint(min_visible, sk + 1, (sq,), dtype=torch.int32, device=device))[0]
         # Make sure last Q position sees at least 1 KV
         vals[-1] = max(vals[-1].item(), 1)
         parts.append(vals)
@@ -322,3 +325,166 @@ def test_release_mask_all_visible(seqlens_q, seqlens_k, d, dtype):
         print(f"All-visible output max diff: {(out_rm - out_ref).abs().max().item():.6f}")
 
     assert torch.allclose(out_rm, out_ref, atol=1e-5)
+
+
+# ============================================================================
+# Sliding window + release_mask tests
+# ============================================================================
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("window_size_left", [32, 64, 128])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_k",
+    [
+        ([128], [256]),
+        ([64], [128]),
+        ([128], [128]),
+        ([64, 128], [128, 64]),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_release_mask_window_fwd(seqlens_q, seqlens_k, d, window_size_left, dtype):
+    """Forward: release_mask + window_size_left vs materialized reference."""
+    if SM120_NO_GQA:
+        pass  # MHA only, no skip needed
+    device = "cuda"
+    nheads = 8
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    torch.manual_seed(42)
+
+    q = torch.randn(total_q, nheads, d, dtype=dtype, device=device)
+    k = torch.randn(total_k, nheads, d, dtype=dtype, device=device)
+    v = torch.randn(total_k, nheads, d, dtype=dtype, device=device)
+
+    cu_seqlens_q = make_cu_seqlens(seqlens_q, device)
+    cu_seqlens_k = make_cu_seqlens(seqlens_k, device)
+
+    if is_fake_mode():
+        release_mask = torch.zeros(total_q, dtype=torch.int32, device=device)
+    else:
+        release_mask = generate_release_mask(seqlens_q, seqlens_k, device, min_visible=1)
+
+    out, lse = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(seqlens_q), max_seqlen_k=max(seqlens_k),
+        causal=False, return_lse=True,
+        release_mask=release_mask, window_size=(window_size_left, None),
+    )
+
+    if is_fake_mode():
+        return
+
+    # Per-batch reference
+    out_ref_parts = []
+    offset_q, offset_k = 0, 0
+    for sq, sk in zip(seqlens_q, seqlens_k):
+        rm_batch = release_mask[offset_q : offset_q + sq]
+        out_b, _ = attention_release_mask_ref(
+            q[offset_q:offset_q+sq], k[offset_k:offset_k+sk], v[offset_k:offset_k+sk],
+            rm_batch, window_size_left=window_size_left,
+        )
+        out_ref_parts.append(out_b)
+        offset_q += sq
+        offset_k += sk
+    out_ref = torch.cat(out_ref_parts, dim=0)
+
+    valid = release_mask > 0
+    out_diff = (out[valid] - out_ref[valid]).abs().max().item() if valid.any() else 0.0
+
+    if VERBOSE:
+        print(f"Window fwd output max diff: {out_diff:.6f}")
+
+    assert out_diff <= 2e-2
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("window_size_left", [32, 64])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_k",
+    [
+        ([128], [256]),
+        ([64], [128]),
+        ([64, 128], [128, 64]),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_release_mask_window_bwd(seqlens_q, seqlens_k, d, window_size_left, dtype):
+    """Backward: release_mask + window_size_left vs materialized reference."""
+    if SM120_NO_GQA:
+        pass  # MHA only, no skip needed
+    device = "cuda"
+    nheads = 8
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    torch.manual_seed(42)
+
+    q = torch.randn(total_q, nheads, d, dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn(total_k, nheads, d, dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn(total_k, nheads, d, dtype=dtype, device=device, requires_grad=True)
+
+    cu_seqlens_q = make_cu_seqlens(seqlens_q, device)
+    cu_seqlens_k = make_cu_seqlens(seqlens_k, device)
+
+    if is_fake_mode():
+        release_mask = torch.zeros(total_q, dtype=torch.int32, device=device)
+    else:
+        release_mask = generate_release_mask(seqlens_q, seqlens_k, device, min_visible=1)
+
+    out, _ = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(seqlens_q), max_seqlen_k=max(seqlens_k),
+        causal=False, return_lse=True,
+        release_mask=release_mask, window_size=(window_size_left, None),
+    )
+
+    if is_fake_mode():
+        return
+
+    dout = torch.randn_like(out)
+    out.backward(dout)
+    dq_fa, dk_fa, dv_fa = q.grad.clone(), k.grad.clone(), v.grad.clone()
+    q.grad, k.grad, v.grad = None, None, None
+
+    # Reference per batch
+    dq_ref = torch.zeros_like(q, dtype=torch.float32)
+    dk_ref = torch.zeros_like(k, dtype=torch.float32)
+    dv_ref = torch.zeros_like(v, dtype=torch.float32)
+
+    offset_q, offset_k = 0, 0
+    for sq, sk in zip(seqlens_q, seqlens_k):
+        q_b = q[offset_q:offset_q+sq].detach().float().requires_grad_(True)
+        k_b = k[offset_k:offset_k+sk].detach().float().requires_grad_(True)
+        v_b = v[offset_k:offset_k+sk].detach().float().requires_grad_(True)
+        rm_b = release_mask[offset_q:offset_q+sq]
+        dout_b = dout[offset_q:offset_q+sq].float()
+
+        out_b, _ = attention_release_mask_ref(q_b, k_b, v_b, rm_b, window_size_left=window_size_left)
+        out_b.backward(dout_b)
+        dq_ref[offset_q:offset_q+sq] = q_b.grad
+        dk_ref[offset_k:offset_k+sk] = k_b.grad
+        dv_ref[offset_k:offset_k+sk] = v_b.grad
+        offset_q += sq
+        offset_k += sk
+
+    def finite_max_diff(a, b):
+        diff = (a - b).abs()
+        finite = torch.isfinite(diff)
+        return diff[finite].max().item() if finite.any() else 0.0
+
+    dq_diff = finite_max_diff(dq_fa, dq_ref.to(dtype))
+    dk_diff = finite_max_diff(dk_fa, dk_ref.to(dtype))
+    dv_diff = finite_max_diff(dv_fa, dv_ref.to(dtype))
+
+    if VERBOSE:
+        print(f"Window bwd dQ diff: {dq_diff:.6f}, dK diff: {dk_diff:.6f}, dV diff: {dv_diff:.6f}")
+
+    assert dq_diff <= 5e-2, f"dQ mismatch: {dq_diff}"
+    assert dk_diff <= 5e-2, f"dK mismatch: {dk_diff}"
+    assert dv_diff <= 5e-2, f"dV mismatch: {dv_diff}"
