@@ -73,6 +73,7 @@ class FlashAttentionBackwardSm90:
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
         dQ_single_wg: bool = False,
+        has_release_mask: bool = False,
     ):
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -134,6 +135,7 @@ class FlashAttentionBackwardSm90:
         else:
             self.vec_size: cutlass.Constexpr = 4
         self.qk_acc_dtype = Float32
+        self.has_release_mask = has_release_mask
         # dQ_single_wg: WG0 computes the full dQ GEMM, WG1 skips it.
         # Only valid for 2 MMA warp groups.
         # Credit: Ben Spector
@@ -358,6 +360,8 @@ class FlashAttentionBackwardSm90:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mReleaseMask: Optional[cute.Tensor] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -601,6 +605,8 @@ class FlashAttentionBackwardSm90:
             mdQ_semaphore,
             window_size_left,
             window_size_right,
+            mReleaseMask,
+            mReleaseMaskK,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -654,6 +660,8 @@ class FlashAttentionBackwardSm90:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
+        mReleaseMask: Optional[cute.Tensor] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -718,6 +726,7 @@ class FlashAttentionBackwardSm90:
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=1,
+            has_release_mask=self.has_release_mask,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -737,6 +746,7 @@ class FlashAttentionBackwardSm90:
             window_size_left=window_size_left,
             window_size_right=window_size_right,
             swap_AB=self.SdP_swapAB,
+            release_mask=mReleaseMask,
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
@@ -767,6 +777,8 @@ class FlashAttentionBackwardSm90:
                     TileSchedulerCls,
                     blocksparse_tensors,
                     qhead_per_kvhead_divmod,
+                    mReleaseMask,
+                    mReleaseMaskK,
                 )
             if warp_idx == 1:
                 self.dQaccum_store(
@@ -777,6 +789,8 @@ class FlashAttentionBackwardSm90:
                     SeqlenInfoCls,
                     blocksparse_tensors,
                     mdQ_semaphore,
+                    mReleaseMask,
+                    mReleaseMaskK,
                 )
         else:
             tidx, _, _ = cute.arch.thread_idx()
@@ -814,6 +828,8 @@ class FlashAttentionBackwardSm90:
                 fastdiv_mods,
                 blocksparse_tensors,
                 qhead_per_kvhead_divmod,
+                mReleaseMask,
+                mReleaseMaskK,
             )
             if const_expr(self.num_wg_dQ == self.num_wg_mma):
                 # Both WGs compute dQ
@@ -855,6 +871,8 @@ class FlashAttentionBackwardSm90:
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        mReleaseMask: Optional[cute.Tensor] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
@@ -912,7 +930,11 @@ class FlashAttentionBackwardSm90:
                 load_dPsum = copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
                 load_dPsum = copy_utils.tma_producer_copy_fn(load_dPsum, pipeline_dO)
 
-                m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+                if const_expr(not self.has_release_mask):
+                    m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+                else:
+                    m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block)
+                    m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
 
                 if const_expr(not self.use_block_sparsity):
                     total_m_block_cnt = m_block_max - m_block_min
@@ -1119,6 +1141,8 @@ class FlashAttentionBackwardSm90:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        mReleaseMask: Optional[cute.Tensor] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
         is_dQ_wg: cutlass.Constexpr[bool] = True,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -1290,7 +1314,10 @@ class FlashAttentionBackwardSm90:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            mask = AttentionMaskCls(seqlen)
+            mask = AttentionMaskCls(
+                seqlen,
+                offset_q=seqlen.offset_q if const_expr(self.has_release_mask) else 0,
+            )
             score_mod_fn_cur = partial(
                 score_mod_fn,
                 batch_idx=batch_idx,
@@ -1305,7 +1332,11 @@ class FlashAttentionBackwardSm90:
                 n_block=n_block,
                 seqlen_info=seqlen,
             )
-            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            if const_expr(not self.has_release_mask):
+                m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            else:
+                m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block)
+                m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
 
             if const_expr(not self.use_block_sparsity):
                 process_tile = (
@@ -1334,6 +1365,7 @@ class FlashAttentionBackwardSm90:
                         mask_seqlen=True,
                         mask_causal=self.is_causal,
                         mask_local=self.is_local,
+                        mask_release=self.has_release_mask,
                         mask_mod=self.mask_mod,
                         aux_tensors=aux_tensors,
                         fastdiv_mods=fastdiv_mods,
@@ -1744,6 +1776,8 @@ class FlashAttentionBackwardSm90:
         SeqlenInfoCls: cutlass.Constexpr[Callable],
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
+        mReleaseMask: Optional[cute.Tensor] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         # warp-local thread index (dQaccum_store runs on warp 1, global tidx 32-63)
@@ -1776,7 +1810,11 @@ class FlashAttentionBackwardSm90:
                 # mdQ_semaphore is (num_m_blocks, cluster_size, num_head, batch) after transpose
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
-            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            if const_expr(not self.has_release_mask):
+                m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            else:
+                m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block)
+                m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
             if const_expr(not self.use_block_sparsity):
                 process_tile = (
                     const_expr(not self.is_local and not self.is_varlen_q)

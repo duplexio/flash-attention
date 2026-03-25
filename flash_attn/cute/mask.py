@@ -108,6 +108,8 @@ class AttentionMask:
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
+    release_mask: Optional[cute.Tensor] = None  # (total_q,) int32
+    offset_q: Int32 = 0
 
     @property
     def seqlen_q(self) -> Int32:
@@ -129,6 +131,7 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr[bool],
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
+        mask_release: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
@@ -152,7 +155,7 @@ class AttentionMask:
         if n_block < 0:
             n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
-        if const_expr(not mask_causal and not mask_local and mask_mod is None):
+        if const_expr(not mask_causal and not mask_local and not mask_release and mask_mod is None):
             if const_expr(mask_seqlen):
                 r2p = const_expr(not self.swap_AB)
                 if const_expr(not r2p):
@@ -166,7 +169,7 @@ class AttentionMask:
                     mask_r2p_lambda(acc_S_mn, lambda s: r2p_bitmask_below(seqlenk_col_limit_r2p, s))
 
         elif const_expr(
-            not mask_causal and not mask_local and mask_mod is not None
+            not mask_causal and not mask_local and not mask_release and mask_mod is not None
         ):  # FlexAttention mask mod
             nrow = const_expr(cute.size(tScS_mn.shape[0]))
             ncol = const_expr(cute.size(tScS_mn.shape[1]))
@@ -224,6 +227,49 @@ class AttentionMask:
                             acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
                     else:
                         acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
+
+        elif const_expr(mask_release):
+            # Release mask: per-Q-row column limit from release_mask tensor.
+            # Structurally identical to causal masking but with a lookup-based col_limit.
+            if const_expr(not self.swap_AB):
+                r2p = True
+                for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
+                    row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
+                    if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                        row_idx = row_idx // self.qhead_per_kvhead_packgqa
+                    visible_kv = self.release_mask[self.offset_q + row_idx]
+                    col_limit_right = visible_kv - n_block * self.tile_n - thr_col_offset
+                    if const_expr(mask_seqlen):
+                        col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
+                    if const_expr(not r2p):
+                        for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
+                            acc_S_mn[r, c] = (
+                                -Float32.inf
+                                if t0ScS_mn[0, c][1] >= col_limit_right
+                                else acc_S_mn[r, c]
+                            )
+                    else:
+                        col_limit_r2p = sm90_col_to_r2p_idx(col_limit_right)
+                        mask_r2p_lambda(
+                            acc_S_mn[r, None],
+                            lambda s: r2p_bitmask_below(col_limit_r2p, s),
+                            rank1=True,
+                        )
+            else:  # swap_AB (backward transposed path)
+                thr_row_offset = tScS_mn[0][ROW]
+                for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
+                    col0 = t0ScS_mn[0, c][COL]
+                    global_col = thr_col_offset + col0 + n_block * self.tile_n
+                    # visible_kv for this KV column: find the row limit
+                    # In the transposed (backward) view, we need release_mask_k
+                    # For now use seqlen masking in the swap_AB case
+                    row_limit_top = self.tile_m if global_col >= self.seqlen_k and mask_seqlen else 0
+                    for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
+                        acc_S_mn[r, c] = (
+                            -Float32.inf
+                            if t0ScS_mn[r, 0][ROW] < row_limit_top
+                            else acc_S_mn[r, c]
+                        )
 
         else:  # Causal or local
             if const_expr(not self.swap_AB):
@@ -377,6 +423,7 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr[bool],
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
+        mask_release: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         batch_idx: Int32 = None,
         head_idx: Int32 = None,
@@ -398,7 +445,7 @@ class AttentionMask:
             n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n
         r2p = True
-        if const_expr(not mask_causal and not mask_local and mask_mod is None):
+        if const_expr(not mask_causal and not mask_local and not mask_release and mask_mod is None):
             if const_expr(mask_seqlen):
                 if const_expr(not r2p):
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
@@ -413,7 +460,7 @@ class AttentionMask:
                         rank1=True,
                     )
 
-        elif const_expr(not mask_causal and not mask_local and mask_mod is not None):
+        elif const_expr(not mask_causal and not mask_local and not mask_release and mask_mod is not None):
             # Block sparse case w/ mask_mod
             has_fastdiv = const_expr(
                 fastdiv_mods is not None
@@ -462,6 +509,26 @@ class AttentionMask:
                     acc_S[i] = -Float32.inf if global_col >= self.seqlen_k else acc_S[i]
                 if check_q_boundary:
                     acc_S[i] = -Float32.inf if mask_row >= self.seqlen_q else acc_S[i]
+
+        elif const_expr(mask_release):
+            # Release mask: per-thread row has its own col_limit from release_mask tensor
+            row_idx = tScS_t2r[0][0] + m_block * self.tile_m
+            if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                row_idx = row_idx // self.qhead_per_kvhead_packgqa
+            visible_kv = self.release_mask[self.offset_q + row_idx]
+            col_limit_right = visible_kv - n_block * self.tile_n
+            if const_expr(mask_seqlen):
+                col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
+            ncol = const_expr(cute.size(tScS_t2r.shape))
+            if const_expr(not r2p):
+                for i in cutlass.range(ncol, unroll_full=True):
+                    acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= col_limit_right else acc_S[i]
+            else:
+                mask_r2p_lambda(
+                    acc_S,
+                    lambda s: r2p_bitmask_below(col_limit_right, s),
+                    rank1=True,
+                )
 
         else:  # Causal or local
             causal_row_offset = self.seqlen_k - n_block * self.tile_n - self.seqlen_q
@@ -537,6 +604,7 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr,
         mask_causal: cutlass.Constexpr,
         mask_local: cutlass.Constexpr,
+        mask_release: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         batch_idx: Int32 = None,
         head_idx: Int32 = None,

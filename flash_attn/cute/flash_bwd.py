@@ -46,6 +46,7 @@ class FlashAttentionBackwardSm80:
         AtomLayoutNdKV: int = 8,
         AtomLayoutMdQ: int = 1,
         V_in_regs: bool = False,
+        has_release_mask: bool = False,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -78,6 +79,7 @@ class FlashAttentionBackwardSm80:
         self.num_threads = num_threads
         self.pack_gqa = pack_gqa
         self.is_causal = is_causal
+        self.has_release_mask = has_release_mask
         self.num_stages_Q = num_stages_Q
         self.num_stages_dO = num_stages_dO
         self.SdP_swapAB = SdP_swapAB
@@ -385,6 +387,8 @@ class FlashAttentionBackwardSm80:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mReleaseMask: Optional[cute.Tensor] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -466,6 +470,8 @@ class FlashAttentionBackwardSm80:
             SharedStorage,
             tile_sched_params,
             TileScheduler,
+            mReleaseMask,
+            mReleaseMaskK,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -510,6 +516,8 @@ class FlashAttentionBackwardSm80:
         SharedStorage: cutlass.Constexpr,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
+        mReleaseMask: Optional[cute.Tensor] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -539,6 +547,10 @@ class FlashAttentionBackwardSm80:
                     (n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k) // self.m_block_size,
                     m_block_min,
                 )
+            if cutlass.const_expr(self.has_release_mask):
+                kv_idx = n_block * self.n_block_size
+                first_q = mReleaseMaskK[seqlen.offset_k + kv_idx]
+                m_block_min = max(first_q // self.m_block_size, m_block_min)
             # TODO: return early if m_block_max == 0
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -812,11 +824,16 @@ class FlashAttentionBackwardSm80:
             # Mainloop
             # ///////////////////////////////////////////////////////////////////////////////
             # Start processing of the first n-block.
-            mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen)
+            mask = AttentionMask(
+                self.m_block_size, self.n_block_size, seqlen,
+                release_mask=mReleaseMask,
+                offset_q=seqlen.offset_q if cutlass.const_expr(self.has_release_mask) else 0,
+            )
             mask_fn = partial(
                 mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
                 batch_idx=batch_idx, head_idx=head_idx,
-                mask_seqlen=True, mask_causal=self.is_causal
+                mask_seqlen=True, mask_causal=self.is_causal,
+                mask_release=self.has_release_mask,
             )
             smem_pipe_read_q = cutlass.Int32(0)
             smem_pipe_read_do = cutlass.Int32(0)

@@ -84,6 +84,7 @@ class FlashAttentionForwardSm100:
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
+        has_release_mask: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -128,6 +129,7 @@ class FlashAttentionForwardSm100:
         self.use_correction_warps_for_epi = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
+        self.has_release_mask = has_release_mask
         self.pack_gqa = pack_gqa
         self.q_subtile_factor = q_subtile_factor
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
@@ -297,6 +299,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mReleaseMask: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -667,6 +670,7 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             head_divmod,
+            mReleaseMask,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -713,6 +717,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
+        mReleaseMask: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -950,6 +955,7 @@ class FlashAttentionForwardSm100:
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            has_release_mask=self.has_release_mask,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -969,6 +975,7 @@ class FlashAttentionForwardSm100:
             window_size_left=window_size_left,
             window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            release_mask=mReleaseMask,
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
@@ -1008,6 +1015,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                mReleaseMask,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1039,6 +1047,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                mReleaseMask,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1062,6 +1071,7 @@ class FlashAttentionForwardSm100:
                     SeqlenInfoCls,
                     TileSchedulerCls,
                     mma_tile_coord_v,
+                    mReleaseMask,
                 )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1098,6 +1108,7 @@ class FlashAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
+                mReleaseMask=mReleaseMask,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1143,6 +1154,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                mReleaseMask,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1171,6 +1183,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        mReleaseMask: Optional[cute.Tensor] = None,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
@@ -1300,9 +1313,14 @@ class FlashAttentionForwardSm100:
             )
 
             if const_expr(not self.use_block_sparsity):
-                n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen, m_block, split_idx, num_splits
-                )
+                if const_expr(not self.has_release_mask):
+                    n_block_min, n_block_max = block_info.get_n_block_min_max(
+                        seqlen, m_block, split_idx, num_splits
+                    )
+                else:
+                    n_block_min = Int32(0)
+                    n_block_max = block_info.get_n_block_max_release_mask(mReleaseMask, seqlen, m_block)
+                    n_block_max = cutlass.min(n_block_max, cute.ceil_div(seqlen.seqlen_k, self.n_block_size))
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                     page_idx = (
@@ -1391,6 +1409,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        mReleaseMask: Optional[cute.Tensor] = None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1499,7 +1518,12 @@ class FlashAttentionForwardSm100:
                 )
                 process_tile = block_iter_count > Int32(0)
             else:
-                n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+                if const_expr(not self.has_release_mask):
+                    n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+                else:
+                    n_block_min = Int32(0)
+                    n_block_max = block_info.get_n_block_max_release_mask(mReleaseMask, seqlen, m_block)
+                    n_block_max = cutlass.min(n_block_max, cute.ceil_div(seqlen.seqlen_k, self.n_block_size))
                 block_iter_count = n_block_max - n_block_min
                 if const_expr(not self.is_split_kv):
                     process_tile = True
@@ -1685,6 +1709,7 @@ class FlashAttentionForwardSm100:
         fastdiv_mods=(None, None),
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mReleaseMask: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1749,9 +1774,14 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            if const_expr(not self.has_release_mask):
+                n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            else:
+                n_block_min = Int32(0)
+                n_block_max = block_info.get_n_block_max_release_mask(mReleaseMask, seqlen, m_block)
+                n_block_max = cutlass.min(n_block_max, cute.ceil_div(seqlen.seqlen_k, self.n_block_size))
 
-            mask = AttentionMaskCls(seqlen)
+            mask = AttentionMaskCls(seqlen, offset_q=seqlen.offset_q if const_expr(self.has_release_mask) else 0)
             shared_mask_kwargs = dict(
                 m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
                 thr_mma=thr_mma_qk,
@@ -1785,6 +1815,7 @@ class FlashAttentionForwardSm100:
             mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
             mask_fn = partial(
                 mask.apply_mask_sm100,
+                mask_release=self.has_release_mask,
                 mask_mod=mask_mod,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
@@ -1794,6 +1825,7 @@ class FlashAttentionForwardSm100:
                 #  Full blocks dont need mask_mod
                 mask_fn_none = partial(
                     mask.apply_mask_sm100,
+                    mask_release=self.has_release_mask,
                     mask_mod=None,
                     fastdiv_mods=fastdiv_mods,
                     head_divmod=head_divmod,
@@ -2160,6 +2192,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mReleaseMask: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2194,7 +2227,12 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            if const_expr(not self.has_release_mask):
+                n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            else:
+                n_block_min = Int32(0)
+                n_block_max = block_info.get_n_block_max_release_mask(mReleaseMask, seqlen, m_block)
+                n_block_max = cutlass.min(n_block_max, cute.ceil_div(seqlen.seqlen_k, self.n_block_size))
 
             if const_expr(self.is_split_kv):
                 mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
@@ -2630,6 +2668,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         mma_tile_coord_v: Int32 = 0,
+        mReleaseMask: Optional[cute.Tensor] = None,
     ):
         epi_consumer_phase = Int32(0)
         tile_scheduler = TileSchedulerCls()
@@ -2637,7 +2676,12 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            if const_expr(not self.has_release_mask):
+                n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            else:
+                n_block_min = Int32(0)
+                n_block_max = block_info.get_n_block_max_release_mask(mReleaseMask, seqlen, m_block)
+                n_block_max = cutlass.min(n_block_max, cute.ceil_div(seqlen.seqlen_k, self.n_block_size))
 
             if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                 if const_expr(self.is_split_kv):

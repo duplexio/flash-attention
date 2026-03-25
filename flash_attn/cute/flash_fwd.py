@@ -56,6 +56,7 @@ class FlashAttentionForwardBase:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         q_subtile_factor: int | None = None,
+        has_release_mask: bool = False,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -89,6 +90,7 @@ class FlashAttentionForwardBase:
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_causal = is_causal
         self.is_local = is_local
+        self.has_release_mask = has_release_mask
         self.pack_gqa = pack_gqa
         self.tile_m = tile_m
         self.tile_n = tile_n
@@ -631,6 +633,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
+        mReleaseMask: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -728,6 +731,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             TileScheduler,
             aux_tensors,
             fastdiv_mods,
+            mReleaseMask,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -767,6 +771,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         TileScheduler: cutlass.Constexpr[Callable],
         aux_tensors=None,
         fastdiv_mods=None,
+        mReleaseMask: Optional[cute.Tensor] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -784,6 +789,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            has_release_mask=self.has_release_mask,
         )
         seqlen = SeqlenInfoQK.create(
             batch_idx=batch_size,
@@ -794,7 +800,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
         )
-        n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+        if const_expr(not self.has_release_mask):
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+        else:
+            n_block_min = Int32(0)
+            n_block_max = block_info.get_n_block_max_release_mask(
+                mReleaseMask, seqlen, m_block
+            )
+            n_block_max = cutlass.min(n_block_max, cute.ceil_div(seqlen.seqlen_k, self.tile_n))
         # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
         # seqlen_q=seqlen_k=0 and n_block_max=0.  Clamp to 0 so we don't use a
         # negative block index for K/V loads; the load/store predicates already
@@ -996,6 +1009,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             window_size_left,
             window_size_right,
             self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            release_mask=mReleaseMask,
+            offset_q=seqlen.offset_q if const_expr(self.has_release_mask) else 0,
         )
         mask_fn = partial(
             mask.apply_mask,
@@ -1005,6 +1020,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             thr_mma=thr_mma_qk,
             mask_causal=self.is_causal,
             mask_local=self.is_local,
+            mask_release=self.has_release_mask,
             aux_tensors=aux_tensors,
             fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
         )
@@ -1038,6 +1054,23 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 )
                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+        # Next couple of iterations with release mask masking
+        if const_expr(self.has_release_mask):
+            n_block_min_release_mask = block_info.get_n_block_min_release_mask_mask(
+                mReleaseMask, seqlen, m_block, n_block_min
+            )
+            for n_tile in cutlass.range(n_block_max - 1 - n_block_min_release_mask, unroll=1):
+                n_block = n_block_max - 2 - n_tile
+                compute_one_n_block(
+                    n_block,
+                    smem_pipe_read,
+                    smem_pipe_write,
+                    seqlen=seqlen,
+                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
+                )
+                smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+                smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+            n_block = cutlass.min(n_block, n_block_min_release_mask)
         # The remaining iterations have no masking
         for n_tile in cutlass.range(n_block, unroll=1):
             compute_one_n_block(

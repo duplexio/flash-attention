@@ -19,6 +19,7 @@ class BlockInfo:
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+    has_release_mask: cutlass.Constexpr[bool] = False
 
     @cute.jit
     def get_n_block_min_max(
@@ -137,3 +138,63 @@ class BlockInfo:
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_left = n_idx - self.window_size_left
             return cutlass.max(n_block_min, cute.ceil_div(n_idx_left, self.tile_n))
+
+    @cute.jit
+    def get_n_block_max_release_mask(
+        self,
+        mReleaseMask: cute.Tensor,
+        seqlen_info: SeqlenInfoQK,
+        m_block: Int32,
+    ) -> Int32:
+        """Compute n_block_max from release_mask for the given Q tile.
+
+        release_mask is monotonically non-decreasing, so the last Q row in the tile
+        has the highest visible KV count.
+
+        m_block is in packed space (pack_gqa multiplied); seqlen_info.seqlen_q is
+        unpacked.  We must clamp in packed space, then convert to unpacked.
+        """
+        seqlen_q_packed = seqlen_info.seqlen_q
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            seqlen_q_packed = seqlen_info.seqlen_q * self.qhead_per_kvhead_packgqa
+        m_idx_max = cutlass.min((m_block + 1) * self.tile_m, seqlen_q_packed)
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
+        max_visible = mReleaseMask[seqlen_info.offset_q + m_idx_max - 1]
+        return cute.ceil_div(max_visible, self.tile_n)
+
+    @cute.jit
+    def get_n_block_min_release_mask_mask(
+        self,
+        mReleaseMask: cute.Tensor,
+        seqlen_info: SeqlenInfoQK,
+        m_block: Int32,
+        n_block_min: Int32,
+    ) -> Int32:
+        """Return the n_block below which all KV in the tile are fully visible to all Q rows.
+
+        The first Q row in the tile has the smallest visible KV count. Tiles fully
+        below that count need no per-element masking.
+        """
+        m_idx_min = m_block * self.tile_m
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa
+        min_visible = mReleaseMask[seqlen_info.offset_q + m_idx_min]
+        return cutlass.max(n_block_min, min_visible // self.tile_n)
+
+    @cute.jit
+    def get_m_block_min_release_mask(
+        self,
+        mReleaseMaskK: cute.Tensor,
+        seqlen_info: SeqlenInfoQK,
+        n_block: Int32,
+    ) -> Int32:
+        """For backward: find the first Q tile that can see this KV tile.
+
+        mReleaseMaskK[j] = first Q index that can see KV position j.
+        """
+        kv_idx = n_block * self.tile_n
+        first_q = mReleaseMaskK[seqlen_info.offset_k + kv_idx]
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            first_q = first_q * self.qhead_per_kvhead_packgqa
+        return first_q // self.tile_m

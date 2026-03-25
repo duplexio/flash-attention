@@ -65,6 +65,7 @@ class FlashAttentionBackwardSm100:
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
+        has_release_mask: bool = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -116,6 +117,7 @@ class FlashAttentionBackwardSm100:
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = False
         self.deterministic = deterministic
+        self.has_release_mask = has_release_mask
 
         # Score mod and mask mod support
         self.score_mod = score_mod
@@ -465,6 +467,8 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mReleaseMask: Optional[cute.Tensor] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -996,6 +1000,8 @@ class FlashAttentionBackwardSm100:
             aux_tensors,
             fastdiv_mods,
             blocksparse_tensors,
+            mReleaseMask,
+            mReleaseMaskK,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1069,6 +1075,8 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mReleaseMask: Optional[cute.Tensor] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1394,6 +1402,7 @@ class FlashAttentionBackwardSm100:
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=1,
+            has_release_mask=self.has_release_mask,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -1415,6 +1424,7 @@ class FlashAttentionBackwardSm100:
             swap_AB=True,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
+            release_mask=mReleaseMask,
         )
         #  EMPTY
         # (15)
@@ -1436,6 +1446,7 @@ class FlashAttentionBackwardSm100:
                     block_info,
                     SeqlenInfoCls,
                     TileSchedulerCls,
+                    mReleaseMaskK,
                 )
 
         #  LOAD
@@ -1486,6 +1497,7 @@ class FlashAttentionBackwardSm100:
                 blocksparse_tensors,
                 should_load_Q=True,
                 should_load_dO=True,
+                mReleaseMaskK=mReleaseMaskK,
             )
 
         #  MMA
@@ -1537,6 +1549,7 @@ class FlashAttentionBackwardSm100:
                 TileSchedulerCls,
                 is_leader_cta,
                 blocksparse_tensors,
+                mReleaseMaskK,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1591,6 +1604,7 @@ class FlashAttentionBackwardSm100:
                 aux_tensors,
                 fastdiv_mods,
                 blocksparse_tensors,
+                mReleaseMaskK,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1612,6 +1626,7 @@ class FlashAttentionBackwardSm100:
                 TileSchedulerCls,
                 mdQ_semaphore,
                 blocksparse_tensors,
+                mReleaseMaskK,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1627,6 +1642,7 @@ class FlashAttentionBackwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
     ):
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         dS_cluster_phase = Int32(0)
@@ -1636,9 +1652,13 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            m_block_min, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
-            )
+            if const_expr(not self.has_release_mask):
+                m_block_min, m_block_max = block_info.get_m_block_min_max(
+                    seqlen, n_block // self.cluster_shape_mnk[0]
+                )
+            else:
+                m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0])
+                m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
             head_idx_kv = head_idx // self.qhead_per_kvhead
 
             process_tile = (
@@ -1707,6 +1727,7 @@ class FlashAttentionBackwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         should_load_Q: bool = True,
         should_load_dO: bool = True,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
     ):
         producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
@@ -1747,9 +1768,13 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            m_block_min, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
-            )
+            if const_expr(not self.has_release_mask):
+                m_block_min, m_block_max = block_info.get_m_block_min_max(
+                    seqlen, n_block // self.cluster_shape_mnk[0]
+                )
+            else:
+                m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0])
+                m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
             head_idx_kv = head_idx // self.qhead_per_kvhead
             n_block_cta_group = n_block // self.cta_group_size
 
@@ -2233,6 +2258,7 @@ class FlashAttentionBackwardSm100:
         TileSchedulerCls: Callable,
         is_leader_cta: cutlass.Boolean,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
     ):
         # [2025-10-21] For reasons I don't understand, putting these partitioning in the main
         # kernel (before warp specialization) is a lot slower tha putting them here.
@@ -2353,9 +2379,13 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)  # must be seqlen_k
-            m_block_min, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
-            )
+            if const_expr(not self.has_release_mask):
+                m_block_min, m_block_max = block_info.get_m_block_min_max(
+                    seqlen, n_block // self.cluster_shape_mnk[0]
+                )
+            else:
+                m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0])
+                m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
 
             if const_expr(self.use_block_sparsity):
                 block_iter_count = get_total_q_block_count_bwd(
@@ -2852,6 +2882,7 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -2967,10 +2998,14 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            m_block_min, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
-            )
-            mask = AttentionMaskCls(seqlen)
+            if const_expr(not self.has_release_mask):
+                m_block_min, m_block_max = block_info.get_m_block_min_max(
+                    seqlen, n_block // self.cluster_shape_mnk[0]
+                )
+            else:
+                m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block // self.cluster_shape_mnk[0])
+                m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
+            mask = AttentionMaskCls(seqlen, offset_q=seqlen.offset_q if const_expr(self.has_release_mask) else 0)
             n_block_for_cluster = n_block // self.cta_group_size
             # TODO: condition mask_seqlen
             mask_fn = partial(
@@ -2981,6 +3016,7 @@ class FlashAttentionBackwardSm100:
                 mask_seqlen=True,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
+                mask_release=self.has_release_mask,
                 mask_mod=self.mask_mod,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
@@ -3427,6 +3463,7 @@ class FlashAttentionBackwardSm100:
         TileSchedulerCls: Callable,
         mdQ_semaphore: Optional[cute.Tensor],
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mReleaseMaskK: Optional[cute.Tensor] = None,
     ):
         num_reduce_threads = cute.arch.WARP_SIZE * len(self.reduce_warp_ids)
         tidx = cute.arch.thread_idx()[0] % num_reduce_threads
@@ -3471,7 +3508,11 @@ class FlashAttentionBackwardSm100:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             n_block_cta_group = n_block // self.cta_group_size  # for 2cta
             seqlen = SeqlenInfoCls(batch_idx)
-            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block_cta_group)
+            if const_expr(not self.has_release_mask):
+                m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block_cta_group)
+            else:
+                m_block_min = block_info.get_m_block_min_release_mask(mReleaseMaskK, seqlen, n_block_cta_group)
+                m_block_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
             else:

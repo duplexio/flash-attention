@@ -316,6 +316,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    release_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -329,6 +330,9 @@ def _flash_attn_fwd(
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+        release_mask: Optional (total_q,) int32 tensor for cross-attention release masking.
+            release_mask[i] = number of KV positions visible to Q position i.
+            Must be monotonically non-decreasing within each batch.
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -389,6 +393,14 @@ def _flash_attn_fwd(
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
+
+    if release_mask is not None:
+        assert release_mask.shape == (total_q,), (
+            f"release_mask must have shape (total_q,)={total_q}, got {release_mask.shape}"
+        )
+        assert release_mask.dtype == torch.int32, "release_mask must be int32"
+        assert release_mask.stride(0) == 1, "release_mask must be contiguous"
+        assert not causal, "release_mask is incompatible with causal=True"
 
     if not is_fake_mode():
         assert all(
@@ -622,6 +634,7 @@ def _flash_attn_fwd(
         mma_pv_is_rs,
         intra_wg_overlap,
         fa_logging.get_fa_log_level(),
+        release_mask is not None,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -660,6 +673,12 @@ def _flash_attn_fwd(
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
+        release_mask_tensor = (
+            to_cute_tensor(release_mask, assumed_align=4, leading_dim=0)
+            if release_mask is not None
+            else None
+        )
+
         if arch // 10 == 8:
             assert page_table is None, "paged KV not supported on SM 8.0"
             assert not is_split_kv, "SplitKV not supported on SM 8.0"
@@ -679,6 +698,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                has_release_mask=release_mask is not None,
             )
         elif arch // 10 == 9:
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
@@ -703,6 +723,7 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
+                has_release_mask=release_mask is not None,
             )
         elif arch // 10 in [10, 11]:
             fa_fwd = FlashAttentionForwardSm100(
@@ -728,6 +749,7 @@ def _flash_attn_fwd(
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
+                has_release_mask=release_mask is not None,
             )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -750,13 +772,14 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                has_release_mask=release_mask is not None,
             )
         else:
             raise ValueError(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+        compile_args = [
             fa_fwd,
             q_tensor,
             k_tensor,
@@ -774,7 +797,17 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
-            current_stream,
+        ]
+        # SM80, SM90, SM100, SM110, SM120 kernels accept mReleaseMask (may be None)
+        if arch // 10 in [8, 9, 10, 11, 12]:
+            compile_args.append(release_mask_tensor)
+        elif release_mask is not None:
+            raise ValueError(
+                f"release_mask is currently only supported on SM80/SM90/SM100/SM110/SM120, got arch={arch}"
+            )
+        compile_args.append(current_stream)
+        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            *compile_args,
             options="--enable-tvm-ffi",
         )
 
@@ -783,7 +816,7 @@ def _flash_attn_fwd(
     # - Return "fake" output tensors, which could be needed in follow-up fake operations
     # Thus, we skip the actual kernel invocation here.
     if not is_fake_mode():
-        _flash_attn_fwd.compile_cache[compile_key](
+        run_args = [
             q.detach(),
             k.detach(),
             v.detach(),
@@ -800,7 +833,10 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
-        )
+        ]
+        if arch // 10 in [8, 9, 10, 11, 12]:
+            run_args.append(release_mask)
+        _flash_attn_fwd.compile_cache[compile_key](*run_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -991,6 +1027,7 @@ def _flash_attn_bwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    release_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
@@ -1022,6 +1059,7 @@ def _flash_attn_bwd(
         cluster_size = 1
         use_2cta_instrs = False
         num_threads = 128
+        dQ_single_wg = False
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
@@ -1269,6 +1307,25 @@ def _flash_attn_bwd(
     if arch // 10 not in [9, 12]:
         num_threads = 384
 
+    # Precompute release_mask_k: for each KV position j, find first Q index that can see it
+    release_mask_k = None
+    if release_mask is not None:
+        if cu_seqlens_q is not None and cu_seqlens_k is not None:
+            release_mask_k = torch.empty(k.shape[0], dtype=torch.int32, device=q.device)
+            batch_size_rm = cu_seqlens_q.shape[0] - 1
+            for b in range(batch_size_rm):
+                oq, ok = cu_seqlens_q[b].item(), cu_seqlens_k[b].item()
+                sq, sk = cu_seqlens_q[b+1].item() - oq, cu_seqlens_k[b+1].item() - ok
+                rm_batch = release_mask[oq:oq+sq]
+                # searchsorted: for each j in [0, sk), find first i where rm_batch[i] > j
+                targets = torch.arange(1, sk + 1, dtype=torch.int32, device=q.device)
+                release_mask_k[ok:ok+sk] = torch.searchsorted(rm_batch, targets)
+        else:
+            total_k_rm = k.shape[0] * k.shape[1] if cu_seqlens_k is None else k.shape[0]
+            release_mask_k = torch.empty(total_k_rm, dtype=torch.int32, device=q.device)
+            targets = torch.arange(1, total_k_rm + 1, dtype=torch.int32, device=q.device)
+            release_mask_k[:] = torch.searchsorted(release_mask, targets)
+
     # Backward kernel: compute dk, dv, dq_accum.
     score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
     score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
@@ -1330,6 +1387,7 @@ def _flash_attn_bwd(
             num_aux_tensors,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
+            release_mask is not None,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
@@ -1359,6 +1417,7 @@ def _flash_attn_bwd(
             num_aux_tensors,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
+            release_mask is not None,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,
@@ -1409,6 +1468,7 @@ def _flash_attn_bwd(
                 AtomLayoutNdKV,
                 AtomLayoutMdQ,
                 V_in_regs=V_in_regs,
+                has_release_mask=release_mask is not None,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
@@ -1438,6 +1498,7 @@ def _flash_attn_bwd(
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
                 dQ_single_wg=dQ_single_wg,
+                has_release_mask=release_mask is not None,
             )
         else:
             fa_bwd_obj = FlashAttentionBackwardSm100(
@@ -1456,6 +1517,7 @@ def _flash_attn_bwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
+                has_release_mask=release_mask is not None,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -1463,8 +1525,11 @@ def _flash_attn_bwd(
         if normalized_block_sparse_tensors is not None:
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
+        release_mask_tensor = to_cute_tensor(release_mask, assumed_align=4, leading_dim=0) if release_mask is not None else None
+        release_mask_k_tensor = to_cute_tensor(release_mask_k, assumed_align=4, leading_dim=0) if release_mask_k is not None else None
+
         # TODO: check @can_implement
-        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+        bwd_compile_args = [
             fa_bwd_obj,
             q_tensor,
             k_tensor,
@@ -1488,11 +1553,17 @@ def _flash_attn_bwd(
             dV_semaphore_tensor,
             cute_aux_tensors,
             sparse_tensors_compile,
-            current_stream,
+        ]
+        # SM80, SM90, SM100, SM110, SM120 kernels accept mReleaseMask/mReleaseMaskK (may be None)
+        if arch // 10 in [8, 9, 10, 11, 12]:
+            bwd_compile_args.extend([release_mask_tensor, release_mask_k_tensor])
+        bwd_compile_args.append(current_stream)
+        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+            *bwd_compile_args,
             options="--enable-tvm-ffi",
         )
     if not is_fake_mode():
-        _flash_attn_bwd.compile_cache[compile_key](
+        bwd_run_args = [
             q.detach(),
             k.detach(),
             v.detach(),
@@ -1515,7 +1586,10 @@ def _flash_attn_bwd(
             dV_semaphore,
             aux_tensors,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-        )
+        ]
+        if arch // 10 in [8, 9, 10, 11, 12]:
+            bwd_run_args.extend([release_mask, release_mask_k])
+        _flash_attn_bwd.compile_cache[compile_key](*bwd_run_args)
 
     if arch // 10 == 9:
         # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
@@ -1667,6 +1741,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        release_mask: Optional[torch.Tensor] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1690,6 +1765,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
+            release_mask=release_mask,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -1700,6 +1776,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.return_lse = return_lse
+        ctx.release_mask = release_mask
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -1731,9 +1808,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_k=ctx.max_seqlen_k,
             deterministic=ctx.deterministic,
             dlse=dlse,
+            release_mask=ctx.release_mask,
         )
 
-        return dq, dk, dv, *((None,) * 20)
+        return dq, dk, dv, *((None,) * 21)
 
 
 def flash_attn_func(
@@ -1800,6 +1878,7 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    release_mask: Optional[torch.Tensor] = None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1823,6 +1902,7 @@ def flash_attn_varlen_func(
         score_mod,
         aux_tensors,
         return_lse,
+        release_mask,
     )
 
 
