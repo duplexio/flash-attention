@@ -459,6 +459,9 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
+    # release_mask handles windowing itself; don't use the standard local masking path
+    if release_mask is not None:
+        local = False
 
     # In fake mode (CPU-only compilation), use a fake stream placeholder.
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)

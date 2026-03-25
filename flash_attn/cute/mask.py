@@ -229,10 +229,12 @@ class AttentionMask:
                         acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
 
         elif const_expr(mask_release):
-            # Release mask: per-Q-row column limit from release_mask tensor.
-            # Structurally identical to causal masking but with a lookup-based col_limit.
+            # Release mask: per-Q-row column limits from release_mask tensor.
+            # Optional window_size_left narrows the visible range to
+            # [max(0, release_mask[i] - window_size_left), release_mask[i]).
             if const_expr(not self.swap_AB):
                 r2p = True
+                has_left = const_expr(self.window_size_left is not None)
                 for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                     row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
                     if const_expr(self.qhead_per_kvhead_packgqa != 1):
@@ -241,20 +243,34 @@ class AttentionMask:
                     col_limit_right = visible_kv - n_block * self.tile_n - thr_col_offset
                     if const_expr(mask_seqlen):
                         col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
+                    col_limit_left = (
+                        cutlass.max(visible_kv - self.window_size_left, 0) - n_block * self.tile_n - thr_col_offset
+                        if const_expr(has_left)
+                        else 0
+                    )
                     if const_expr(not r2p):
                         for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
-                            acc_S_mn[r, c] = (
-                                -Float32.inf
-                                if t0ScS_mn[0, c][1] >= col_limit_right
-                                else acc_S_mn[r, c]
-                            )
+                            col_idx = t0ScS_mn[0, c][1]
+                            if col_idx >= col_limit_right or col_idx < col_limit_left:
+                                acc_S_mn[r, c] = -Float32.inf
                     else:
-                        col_limit_r2p = sm90_col_to_r2p_idx(col_limit_right)
-                        mask_r2p_lambda(
-                            acc_S_mn[r, None],
-                            lambda s: r2p_bitmask_below(col_limit_r2p, s),
-                            rank1=True,
-                        )
+                        if const_expr(not has_left):
+                            col_limit_r2p = sm90_col_to_r2p_idx(col_limit_right)
+                            mask_r2p_lambda(
+                                acc_S_mn[r, None],
+                                lambda s: r2p_bitmask_below(col_limit_r2p, s),
+                                rank1=True,
+                            )
+                        else:
+                            col_limit_right_r2p = sm90_col_to_r2p_idx(col_limit_right)
+                            col_limit_left_r2p = sm90_col_to_r2p_idx(col_limit_left)
+
+                            def mask_gen_fn(s: int) -> Uint32:
+                                return r2p_bitmask_below(
+                                    col_limit_right_r2p, s
+                                ) & r2p_bitmask_above(col_limit_left_r2p, s)
+
+                            mask_r2p_lambda(acc_S_mn[r, None], mask_gen_fn, rank1=True)
             else:  # swap_AB (backward transposed path)
                 thr_row_offset = tScS_mn[0][ROW]
                 for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
@@ -519,16 +535,35 @@ class AttentionMask:
             col_limit_right = visible_kv - n_block * self.tile_n
             if const_expr(mask_seqlen):
                 col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
+            has_left = const_expr(self.window_size_left is not None)
+            col_limit_left = (
+                cutlass.max(visible_kv - self.window_size_left, 0) - n_block * self.tile_n
+                if const_expr(has_left)
+                else 0
+            )
             ncol = const_expr(cute.size(tScS_t2r.shape))
             if const_expr(not r2p):
                 for i in cutlass.range(ncol, unroll_full=True):
-                    acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= col_limit_right else acc_S[i]
+                    col_idx = tScS_t2r[i][1]
+                    acc_S[i] = (
+                        -Float32.inf
+                        if col_idx >= col_limit_right or col_idx < col_limit_left
+                        else acc_S[i]
+                    )
             else:
-                mask_r2p_lambda(
-                    acc_S,
-                    lambda s: r2p_bitmask_below(col_limit_right, s),
-                    rank1=True,
-                )
+                if const_expr(not has_left):
+                    mask_r2p_lambda(
+                        acc_S,
+                        lambda s: r2p_bitmask_below(col_limit_right, s),
+                        rank1=True,
+                    )
+                else:
+                    def mask_gen_fn(s: int) -> Uint32:
+                        return r2p_bitmask_below(col_limit_right, s) & r2p_bitmask_above(
+                            col_limit_left, s
+                        )
+
+                    mask_r2p_lambda(acc_S, mask_gen_fn, rank1=True)
 
         else:  # Causal or local
             causal_row_offset = self.seqlen_k - n_block * self.tile_n - self.seqlen_q

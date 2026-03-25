@@ -164,6 +164,52 @@ class BlockInfo:
         return cute.ceil_div(max_visible, self.tile_n)
 
     @cute.jit
+    def get_n_block_min_release_mask_window(
+        self,
+        mReleaseMask: cute.Tensor,
+        seqlen_info: SeqlenInfoQK,
+        m_block: Int32,
+        window_size_left: Int32,
+    ) -> Int32:
+        """Compute n_block_min when release_mask is combined with window_size_left.
+
+        The left boundary for Q row i is max(0, release_mask[i] - window_size_left).
+        The first Q row has the smallest release_mask → smallest left boundary.
+        """
+        m_idx_min = m_block * self.tile_m
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa
+        min_visible = mReleaseMask[seqlen_info.offset_q + m_idx_min]
+        left_boundary = cutlass.max(min_visible - window_size_left, 0)
+        return left_boundary // self.tile_n
+
+    @cute.jit
+    def get_n_block_max_release_mask_window_mask(
+        self,
+        mReleaseMask: cute.Tensor,
+        seqlen_info: SeqlenInfoQK,
+        m_block: Int32,
+        window_size_left: Int32,
+        n_block_max: Int32,
+    ) -> Int32:
+        """Where left-side masking stops being needed.
+
+        The last Q row has the largest left boundary. Tiles at or above
+        ceil_div(max_left_boundary, tile_n) are fully past the left edge
+        for all Q rows, so they need left-side masking.
+        Tiles below this point are fully within the window for all Q rows.
+        """
+        seqlen_q_packed = seqlen_info.seqlen_q
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            seqlen_q_packed = seqlen_info.seqlen_q * self.qhead_per_kvhead_packgqa
+        m_idx_max = cutlass.min((m_block + 1) * self.tile_m, seqlen_q_packed)
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
+        max_visible = mReleaseMask[seqlen_info.offset_q + m_idx_max - 1]
+        max_left = cutlass.max(max_visible - window_size_left, 0)
+        return cutlass.min(n_block_max, cute.ceil_div(max_left, self.tile_n))
+
+    @cute.jit
     def get_n_block_min_release_mask_mask(
         self,
         mReleaseMask: cute.Tensor,

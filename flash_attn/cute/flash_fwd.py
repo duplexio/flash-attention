@@ -628,8 +628,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
@@ -643,6 +643,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
         assert learnable_sink is None, "Learnable sink is not supported in this kernel"
+        window_size_left = Int32(window_size_left) if window_size_left is not None else None
+        window_size_right = Int32(window_size_right) if window_size_right is not None else None
         self._check_type(
             *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
@@ -803,7 +805,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         if const_expr(not self.has_release_mask):
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
         else:
-            n_block_min = Int32(0)
+            if const_expr(window_size_left is not None):
+                n_block_min = block_info.get_n_block_min_release_mask_window(
+                    mReleaseMask, seqlen, m_block, window_size_left
+                )
+            else:
+                n_block_min = Int32(0)
             n_block_max = block_info.get_n_block_max_release_mask(
                 mReleaseMask, seqlen, m_block
             )
@@ -1072,7 +1079,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             n_block = cutlass.min(n_block, n_block_min_release_mask)
         # The remaining iterations have no masking
-        for n_tile in cutlass.range(n_block, unroll=1):
+        for n_tile in cutlass.range(n_block - n_block_min, unroll=1):
             compute_one_n_block(
                 n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
                 seqlen=seqlen, is_first_n_block=False,
@@ -1080,7 +1087,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             )
             smem_pipe_read = self.advance_pipeline(smem_pipe_read)
             smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-        # TODO: local
 
         # normalize acc_O by row_sum and calculate the lse
         row_scale = softmax.finalize()
