@@ -1,4 +1,4 @@
-"""Benchmark release_mask cross-attention vs materialized mask (PyTorch SDPA)."""
+"""Benchmark kv_seqused cross-attention vs materialized mask (PyTorch SDPA)."""
 
 import torch
 import torch.nn.functional as F
@@ -23,8 +23,8 @@ def bench_fn(fn, warmup=10, rep=100):
     return start.elapsed_time(end) / rep  # ms
 
 
-def make_release_mask(seqlen_q, seqlen_k, device, sparsity=0.5):
-    """Generate release_mask where ~sparsity fraction of KV is visible on average."""
+def make_kv_seqused(seqlen_q, seqlen_k, device, sparsity=0.5):
+    """Generate kv_seqused where ~sparsity fraction of KV is visible on average."""
     # Linear ramp: row i sees i/seqlen_q * seqlen_k positions (like causal but for cross-attn)
     visible = torch.linspace(0, seqlen_k, seqlen_q, device=device).int()
     visible = (visible * sparsity * 2).clamp(0, seqlen_k).to(torch.int32)
@@ -33,7 +33,7 @@ def make_release_mask(seqlen_q, seqlen_k, device, sparsity=0.5):
     return visible
 
 
-def materialize_and_sdpa(q_batch, k_batch, v_batch, release_mask_batch, seqlen_q, seqlen_k):
+def materialize_and_sdpa(q_batch, k_batch, v_batch, kv_seqused_batch, seqlen_q, seqlen_k):
     """Reference: materialize full mask, use PyTorch SDPA."""
     # q_batch: (1, seqlen_q, nheads, d) -> (1, nheads, seqlen_q, d)
     q_t = q_batch.transpose(1, 2)
@@ -42,7 +42,7 @@ def materialize_and_sdpa(q_batch, k_batch, v_batch, release_mask_batch, seqlen_q
 
     # Build additive mask (1, 1, seqlen_q, seqlen_k)
     kv_idx = torch.arange(seqlen_k, device=q_batch.device).unsqueeze(0)
-    visible = release_mask_batch.unsqueeze(1)
+    visible = kv_seqused_batch.unsqueeze(1)
     bool_mask = kv_idx < visible  # (seqlen_q, seqlen_k)
     attn_mask = torch.where(bool_mask, 0.0, float("-inf")).unsqueeze(0).unsqueeze(0)
     attn_mask = attn_mask.to(q_batch.dtype)
@@ -68,8 +68,8 @@ def run_benchmark(seqlen_q, seqlen_k, nheads, d, sparsity, batch_size=1, backwar
     # Build release mask
     parts = []
     for _ in range(batch_size):
-        parts.append(make_release_mask(seqlen_q, seqlen_k, device, sparsity))
-    release_mask = torch.cat(parts)
+        parts.append(make_kv_seqused(seqlen_q, seqlen_k, device, sparsity))
+    kv_seqused = torch.cat(parts)
 
     # For SDPA: need batched tensors
     q_batch = q.view(batch_size, seqlen_q, nheads, d)
@@ -78,13 +78,13 @@ def run_benchmark(seqlen_q, seqlen_k, nheads, d, sparsity, batch_size=1, backwar
 
     dout = torch.randn_like(q) if backward else None
 
-    # --- FA4 with release_mask ---
+    # --- FA4 with kv_seqused ---
     def fa4_fwd():
         return flash_attn_varlen_func(
             q, k, v,
             cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
             max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k,
-            causal=False, release_mask=release_mask,
+            causal=False, kv_seqused=kv_seqused,
         )
 
     def fa4_fwd_bwd():
@@ -92,7 +92,7 @@ def run_benchmark(seqlen_q, seqlen_k, nheads, d, sparsity, batch_size=1, backwar
             q, k, v,
             cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
             max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k,
-            causal=False, release_mask=release_mask,
+            causal=False, kv_seqused=kv_seqused,
         )
         out.backward(dout)
         q.grad = k.grad = v.grad = None
@@ -102,7 +102,7 @@ def run_benchmark(seqlen_q, seqlen_k, nheads, d, sparsity, batch_size=1, backwar
         for b in range(batch_size):
             materialize_and_sdpa(
                 q_batch[b:b+1], k_batch[b:b+1], v_batch[b:b+1],
-                release_mask[b*seqlen_q:(b+1)*seqlen_q],
+                kv_seqused[b*seqlen_q:(b+1)*seqlen_q],
                 seqlen_q, seqlen_k,
             )
 
@@ -111,14 +111,14 @@ def run_benchmark(seqlen_q, seqlen_k, nheads, d, sparsity, batch_size=1, backwar
         for b in range(batch_size):
             outs.append(materialize_and_sdpa(
                 q_batch[b:b+1], k_batch[b:b+1], v_batch[b:b+1],
-                release_mask[b*seqlen_q:(b+1)*seqlen_q],
+                kv_seqused[b*seqlen_q:(b+1)*seqlen_q],
                 seqlen_q, seqlen_k,
             ))
         out_cat = torch.cat(outs, dim=0).reshape_as(q)
         out_cat.backward(dout)
         q.grad = k.grad = v.grad = None
 
-    # --- FA4 without release_mask (full non-causal, upper bound) ---
+    # --- FA4 without kv_seqused (full non-causal, upper bound) ---
     def fa4_no_mask_fwd():
         return flash_attn_varlen_func(
             q, k, v,

@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
-# Tests for release_mask cross-attention support (forward + backward).
+# Tests for kv_seqused cross-attention support (forward + backward).
 
 import math
 import os
@@ -19,11 +19,11 @@ VERBOSE = True
 
 pytestmark = pytest.mark.skipif(
     SM_MAJOR not in (8, 9, 10, 11, 12) and not USE_FAKE_TENSOR,
-    reason="release_mask not supported on this GPU arch",
+    reason="kv_seqused not supported on this GPU arch",
 )
 
 
-def attention_release_mask_ref(q, k, v, release_mask, softmax_scale=None, window_size_left=None):
+def attention_kv_seqused_ref(q, k, v, kv_seqused, softmax_scale=None, window_size_left=None):
     """Differentiable reference: materialize full mask, compute attention with autograd.
 
     All inputs must have requires_grad=True (for q, k, v) to get gradients.
@@ -40,9 +40,9 @@ def attention_release_mask_ref(q, k, v, release_mask, softmax_scale=None, window
     scores = torch.einsum("qhd,khd->hqk", q.float() * softmax_scale, k_expanded.float())
 
     kv_idx = torch.arange(total_k, device=q.device).unsqueeze(0)
-    right = release_mask.unsqueeze(1)
+    right = kv_seqused.unsqueeze(1)
     if window_size_left is not None:
-        left = (release_mask - window_size_left).clamp(min=0).unsqueeze(1)
+        left = (kv_seqused - window_size_left).clamp(min=0).unsqueeze(1)
         mask = (kv_idx >= left) & (kv_idx < right)
     else:
         mask = kv_idx < right
@@ -54,8 +54,8 @@ def attention_release_mask_ref(q, k, v, release_mask, softmax_scale=None, window
     return out.to(q.dtype), lse
 
 
-def generate_release_mask(seqlens_q, seqlens_k, device, min_visible=0):
-    """Generate a random monotonically non-decreasing release_mask."""
+def generate_kv_seqused(seqlens_q, seqlens_k, device, min_visible=0):
+    """Generate a random monotonically non-decreasing kv_seqused."""
     parts = []
     for sq, sk in zip(seqlens_q, seqlens_k):
         vals = torch.sort(torch.randint(min_visible, sk + 1, (sq,), dtype=torch.int32, device=device))[0]
@@ -93,7 +93,7 @@ def make_cu_seqlens(seqlens, device):
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_release_mask_fwd(seqlens_q, seqlens_k, d, mha_type, dtype):
+def test_kv_seqused_fwd(seqlens_q, seqlens_k, d, mha_type, dtype):
     if SM120_NO_GQA and mha_type == "gqa":
         pytest.skip("SM120 varlen + GQA is pre-existing broken")
     device = "cuda"
@@ -113,15 +113,15 @@ def test_release_mask_fwd(seqlens_q, seqlens_k, d, mha_type, dtype):
     cu_seqlens_k = make_cu_seqlens(seqlens_k, device)
 
     if is_fake_mode():
-        release_mask = torch.zeros(total_q, dtype=torch.int32, device=device)
+        kv_seqused = torch.zeros(total_q, dtype=torch.int32, device=device)
     else:
-        release_mask = generate_release_mask(seqlens_q, seqlens_k, device)
+        kv_seqused = generate_kv_seqused(seqlens_q, seqlens_k, device)
 
     out, lse = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max(seqlens_q), max_seqlen_k=max(seqlens_k),
-        causal=False, return_lse=True, release_mask=release_mask,
+        causal=False, return_lse=True, kv_seqused=kv_seqused,
     )
 
     if is_fake_mode():
@@ -131,8 +131,8 @@ def test_release_mask_fwd(seqlens_q, seqlens_k, d, mha_type, dtype):
     out_ref_parts, lse_ref_parts = [], []
     offset_q, offset_k = 0, 0
     for sq, sk in zip(seqlens_q, seqlens_k):
-        rm_batch = release_mask[offset_q : offset_q + sq]
-        out_b, lse_b = attention_release_mask_ref(
+        rm_batch = kv_seqused[offset_q : offset_q + sq]
+        out_b, lse_b = attention_kv_seqused_ref(
             q[offset_q:offset_q+sq], k[offset_k:offset_k+sk], v[offset_k:offset_k+sk], rm_batch,
         )
         out_ref_parts.append(out_b)
@@ -143,8 +143,8 @@ def test_release_mask_fwd(seqlens_q, seqlens_k, d, mha_type, dtype):
     out_ref = torch.cat(out_ref_parts, dim=0)
     lse_ref = torch.cat(lse_ref_parts, dim=1)
 
-    # Rows with release_mask=0 produce NaN (all -inf scores); exclude from comparison
-    valid = release_mask > 0
+    # Rows with kv_seqused=0 produce NaN (all -inf scores); exclude from comparison
+    valid = kv_seqused > 0
     out_diff = (out[valid] - out_ref[valid]).abs().max().item() if valid.any() else 0.0
     lse_diff = (lse[:, valid] - lse_ref[:, valid]).abs().max().item() if valid.any() else 0.0
 
@@ -180,7 +180,7 @@ def test_release_mask_fwd(seqlens_q, seqlens_k, d, mha_type, dtype):
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_release_mask_bwd(seqlens_q, seqlens_k, d, mha_type, dtype):
+def test_kv_seqused_bwd(seqlens_q, seqlens_k, d, mha_type, dtype):
     if SM120_NO_GQA and mha_type == "gqa":
         pytest.skip("SM120 varlen + GQA is pre-existing broken")
     device = "cuda"
@@ -200,16 +200,16 @@ def test_release_mask_bwd(seqlens_q, seqlens_k, d, mha_type, dtype):
     cu_seqlens_k = make_cu_seqlens(seqlens_k, device)
 
     if is_fake_mode():
-        release_mask = torch.zeros(total_q, dtype=torch.int32, device=device)
+        kv_seqused = torch.zeros(total_q, dtype=torch.int32, device=device)
     else:
-        release_mask = generate_release_mask(seqlens_q, seqlens_k, device)
+        kv_seqused = generate_kv_seqused(seqlens_q, seqlens_k, device)
 
     # Forward with flash attention
     out, lse = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max(seqlens_q), max_seqlen_k=max(seqlens_k),
-        causal=False, return_lse=True, release_mask=release_mask,
+        causal=False, return_lse=True, kv_seqused=kv_seqused,
     )
 
     if is_fake_mode():
@@ -231,10 +231,10 @@ def test_release_mask_bwd(seqlens_q, seqlens_k, d, mha_type, dtype):
         q_b = q[offset_q:offset_q+sq].detach().float().requires_grad_(True)
         k_b = k[offset_k:offset_k+sk].detach().float().requires_grad_(True)
         v_b = v[offset_k:offset_k+sk].detach().float().requires_grad_(True)
-        rm_b = release_mask[offset_q:offset_q+sq]
+        rm_b = kv_seqused[offset_q:offset_q+sq]
         dout_b = dout[offset_q:offset_q+sq].float()
 
-        out_b, _ = attention_release_mask_ref(q_b, k_b, v_b, rm_b)
+        out_b, _ = attention_kv_seqused_ref(q_b, k_b, v_b, rm_b)
         out_b.backward(dout_b)
         dq_ref[offset_q:offset_q+sq] = q_b.grad
         dk_ref[offset_k:offset_k+sk] = k_b.grad
@@ -246,7 +246,7 @@ def test_release_mask_bwd(seqlens_q, seqlens_k, d, mha_type, dtype):
     dk_ref = dk_ref.to(dtype)
     dv_ref = dv_ref.to(dtype)
 
-    # NaN can appear in gradients when release_mask=0 (all -inf scores)
+    # NaN can appear in gradients when kv_seqused=0 (all -inf scores)
     def finite_max_diff(a, b):
         diff = (a - b).abs()
         finite = torch.isfinite(diff)
@@ -280,8 +280,8 @@ def test_release_mask_bwd(seqlens_q, seqlens_k, d, mha_type, dtype):
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_release_mask_all_visible(seqlens_q, seqlens_k, d, dtype):
-    """release_mask with all KV visible should match non-causal attention."""
+def test_kv_seqused_all_visible(seqlens_q, seqlens_k, d, dtype):
+    """kv_seqused with all KV visible should match non-causal attention."""
     device = "cuda"
     nheads = 4
     total_q = sum(seqlens_q)
@@ -297,18 +297,18 @@ def test_release_mask_all_visible(seqlens_q, seqlens_k, d, dtype):
     cu_seqlens_k = make_cu_seqlens(seqlens_k, device)
 
     if is_fake_mode():
-        release_mask = torch.zeros(total_q, dtype=torch.int32, device=device)
+        kv_seqused = torch.zeros(total_q, dtype=torch.int32, device=device)
     else:
         parts = []
         for sq, sk in zip(seqlens_q, seqlens_k):
             parts.append(torch.full((sq,), sk, dtype=torch.int32, device=device))
-        release_mask = torch.cat(parts)
+        kv_seqused = torch.cat(parts)
 
     out_rm, _ = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max(seqlens_q), max_seqlen_k=max(seqlens_k),
-        causal=False, return_lse=True, release_mask=release_mask,
+        causal=False, return_lse=True, kv_seqused=kv_seqused,
     )
 
     out_ref, _ = flash_attn_varlen_func(
@@ -328,7 +328,7 @@ def test_release_mask_all_visible(seqlens_q, seqlens_k, d, dtype):
 
 
 # ============================================================================
-# Sliding window + release_mask tests
+# Sliding window + kv_seqused tests
 # ============================================================================
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -344,8 +344,8 @@ def test_release_mask_all_visible(seqlens_q, seqlens_k, d, dtype):
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_release_mask_window_fwd(seqlens_q, seqlens_k, d, window_size_left, dtype):
-    """Forward: release_mask + window_size_left vs materialized reference."""
+def test_kv_seqused_window_fwd(seqlens_q, seqlens_k, d, window_size_left, dtype):
+    """Forward: kv_seqused + window_size_left vs materialized reference."""
     if SM120_NO_GQA:
         pass  # MHA only, no skip needed
     device = "cuda"
@@ -363,16 +363,16 @@ def test_release_mask_window_fwd(seqlens_q, seqlens_k, d, window_size_left, dtyp
     cu_seqlens_k = make_cu_seqlens(seqlens_k, device)
 
     if is_fake_mode():
-        release_mask = torch.zeros(total_q, dtype=torch.int32, device=device)
+        kv_seqused = torch.zeros(total_q, dtype=torch.int32, device=device)
     else:
-        release_mask = generate_release_mask(seqlens_q, seqlens_k, device, min_visible=1)
+        kv_seqused = generate_kv_seqused(seqlens_q, seqlens_k, device, min_visible=1)
 
     out, lse = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max(seqlens_q), max_seqlen_k=max(seqlens_k),
         causal=False, return_lse=True,
-        release_mask=release_mask, window_size=(window_size_left, None),
+        kv_seqused=kv_seqused, window_size=(window_size_left, None),
     )
 
     if is_fake_mode():
@@ -382,8 +382,8 @@ def test_release_mask_window_fwd(seqlens_q, seqlens_k, d, window_size_left, dtyp
     out_ref_parts = []
     offset_q, offset_k = 0, 0
     for sq, sk in zip(seqlens_q, seqlens_k):
-        rm_batch = release_mask[offset_q : offset_q + sq]
-        out_b, _ = attention_release_mask_ref(
+        rm_batch = kv_seqused[offset_q : offset_q + sq]
+        out_b, _ = attention_kv_seqused_ref(
             q[offset_q:offset_q+sq], k[offset_k:offset_k+sk], v[offset_k:offset_k+sk],
             rm_batch, window_size_left=window_size_left,
         )
@@ -392,7 +392,7 @@ def test_release_mask_window_fwd(seqlens_q, seqlens_k, d, window_size_left, dtyp
         offset_k += sk
     out_ref = torch.cat(out_ref_parts, dim=0)
 
-    valid = release_mask > 0
+    valid = kv_seqused > 0
     out_diff = (out[valid] - out_ref[valid]).abs().max().item() if valid.any() else 0.0
 
     if VERBOSE:
@@ -413,8 +413,8 @@ def test_release_mask_window_fwd(seqlens_q, seqlens_k, d, window_size_left, dtyp
     ],
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_release_mask_window_bwd(seqlens_q, seqlens_k, d, window_size_left, dtype):
-    """Backward: release_mask + window_size_left vs materialized reference."""
+def test_kv_seqused_window_bwd(seqlens_q, seqlens_k, d, window_size_left, dtype):
+    """Backward: kv_seqused + window_size_left vs materialized reference."""
     if SM120_NO_GQA:
         pass  # MHA only, no skip needed
     device = "cuda"
@@ -432,16 +432,16 @@ def test_release_mask_window_bwd(seqlens_q, seqlens_k, d, window_size_left, dtyp
     cu_seqlens_k = make_cu_seqlens(seqlens_k, device)
 
     if is_fake_mode():
-        release_mask = torch.zeros(total_q, dtype=torch.int32, device=device)
+        kv_seqused = torch.zeros(total_q, dtype=torch.int32, device=device)
     else:
-        release_mask = generate_release_mask(seqlens_q, seqlens_k, device, min_visible=1)
+        kv_seqused = generate_kv_seqused(seqlens_q, seqlens_k, device, min_visible=1)
 
     out, _ = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max(seqlens_q), max_seqlen_k=max(seqlens_k),
         causal=False, return_lse=True,
-        release_mask=release_mask, window_size=(window_size_left, None),
+        kv_seqused=kv_seqused, window_size=(window_size_left, None),
     )
 
     if is_fake_mode():
@@ -462,10 +462,10 @@ def test_release_mask_window_bwd(seqlens_q, seqlens_k, d, window_size_left, dtyp
         q_b = q[offset_q:offset_q+sq].detach().float().requires_grad_(True)
         k_b = k[offset_k:offset_k+sk].detach().float().requires_grad_(True)
         v_b = v[offset_k:offset_k+sk].detach().float().requires_grad_(True)
-        rm_b = release_mask[offset_q:offset_q+sq]
+        rm_b = kv_seqused[offset_q:offset_q+sq]
         dout_b = dout[offset_q:offset_q+sq].float()
 
-        out_b, _ = attention_release_mask_ref(q_b, k_b, v_b, rm_b, window_size_left=window_size_left)
+        out_b, _ = attention_kv_seqused_ref(q_b, k_b, v_b, rm_b, window_size_left=window_size_left)
         out_b.backward(dout_b)
         dq_ref[offset_q:offset_q+sq] = q_b.grad
         dk_ref[offset_k:offset_k+sk] = k_b.grad
