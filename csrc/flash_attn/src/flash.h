@@ -78,6 +78,10 @@ struct Flash_fwd_params : public Qkv_params {
     // If provided, the actual length of each k sequence.
     int * __restrict__ seqused_k;
 
+    // If provided, per-query KV visibility count: col_limit[q_idx] = number of
+    // KV positions visible to query q_idx. Shape (total_q,) int32.
+    int * __restrict__ col_limit;
+
     int *__restrict__ blockmask;
 
     // The K_new and V_new matrices.
@@ -182,6 +186,10 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     bool deterministic;
     index_t dq_accum_split_stride;
+
+    // Per-KV inverse of col_limit: row_limit[kv_idx] = first Q index that can see kv_idx.
+    // Shape (total_k,) int32. Used for block skipping in backward.
+    int * __restrict__ row_limit;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

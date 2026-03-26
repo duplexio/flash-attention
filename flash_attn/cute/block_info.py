@@ -19,7 +19,7 @@ class BlockInfo:
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
-    has_kv_seqused: cutlass.Constexpr[bool] = False
+    has_col_limit: cutlass.Constexpr[bool] = False
 
     @cute.jit
     def get_n_block_min_max(
@@ -140,15 +140,15 @@ class BlockInfo:
             return cutlass.max(n_block_min, cute.ceil_div(n_idx_left, self.tile_n))
 
     @cute.jit
-    def get_n_block_max_kv_seqused(
+    def get_n_block_max_col_limit(
         self,
-        mKvSeqused: cute.Tensor,
+        mColLimit: cute.Tensor,
         seqlen_info: SeqlenInfoQK,
         m_block: Int32,
     ) -> Int32:
-        """Compute n_block_max from kv_seqused for the given Q tile.
+        """Compute n_block_max from col_limit for the given Q tile.
 
-        kv_seqused is monotonically non-decreasing, so the last Q row in the tile
+        col_limit is monotonically non-decreasing, so the last Q row in the tile
         has the highest visible KV count.
 
         m_block is in packed space (pack_gqa multiplied); seqlen_info.seqlen_q is
@@ -160,33 +160,33 @@ class BlockInfo:
         m_idx_max = cutlass.min((m_block + 1) * self.tile_m, seqlen_q_packed)
         if const_expr(self.qhead_per_kvhead_packgqa > 1):
             m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
-        max_visible = mKvSeqused[seqlen_info.offset_q + m_idx_max - 1]
+        max_visible = mColLimit[seqlen_info.offset_q + m_idx_max - 1]
         return cute.ceil_div(max_visible, self.tile_n)
 
     @cute.jit
-    def get_n_block_min_kv_seqused_window(
+    def get_n_block_min_col_limit_window(
         self,
-        mKvSeqused: cute.Tensor,
+        mColLimit: cute.Tensor,
         seqlen_info: SeqlenInfoQK,
         m_block: Int32,
         window_size_left: Int32,
     ) -> Int32:
-        """Compute n_block_min when kv_seqused is combined with window_size_left.
+        """Compute n_block_min when col_limit is combined with window_size_left.
 
-        The left boundary for Q row i is max(0, kv_seqused[i] - window_size_left).
-        The first Q row has the smallest kv_seqused → smallest left boundary.
+        The left boundary for Q row i is max(0, col_limit[i] - window_size_left).
+        The first Q row has the smallest col_limit → smallest left boundary.
         """
         m_idx_min = m_block * self.tile_m
         if const_expr(self.qhead_per_kvhead_packgqa > 1):
             m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa
-        min_visible = mKvSeqused[seqlen_info.offset_q + m_idx_min]
+        min_visible = mColLimit[seqlen_info.offset_q + m_idx_min]
         left_boundary = cutlass.max(min_visible - window_size_left, 0)
         return left_boundary // self.tile_n
 
     @cute.jit
-    def get_n_block_max_kv_seqused_window_mask(
+    def get_n_block_max_col_limit_window_mask(
         self,
-        mKvSeqused: cute.Tensor,
+        mColLimit: cute.Tensor,
         seqlen_info: SeqlenInfoQK,
         m_block: Int32,
         window_size_left: Int32,
@@ -205,14 +205,14 @@ class BlockInfo:
         m_idx_max = cutlass.min((m_block + 1) * self.tile_m, seqlen_q_packed)
         if const_expr(self.qhead_per_kvhead_packgqa > 1):
             m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
-        max_visible = mKvSeqused[seqlen_info.offset_q + m_idx_max - 1]
+        max_visible = mColLimit[seqlen_info.offset_q + m_idx_max - 1]
         max_left = cutlass.max(max_visible - window_size_left, 0)
         return cutlass.min(n_block_max, cute.ceil_div(max_left, self.tile_n))
 
     @cute.jit
-    def get_n_block_min_kv_seqused_mask(
+    def get_n_block_min_col_limit_mask(
         self,
-        mKvSeqused: cute.Tensor,
+        mColLimit: cute.Tensor,
         seqlen_info: SeqlenInfoQK,
         m_block: Int32,
         n_block_min: Int32,
@@ -225,43 +225,43 @@ class BlockInfo:
         m_idx_min = m_block * self.tile_m
         if const_expr(self.qhead_per_kvhead_packgqa > 1):
             m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa
-        min_visible = mKvSeqused[seqlen_info.offset_q + m_idx_min]
+        min_visible = mColLimit[seqlen_info.offset_q + m_idx_min]
         return cutlass.max(n_block_min, min_visible // self.tile_n)
 
     @cute.jit
-    def get_m_block_min_kv_seqused(
+    def get_m_block_min_col_limit(
         self,
-        mKvSequsedK: cute.Tensor,
+        mRowLimit: cute.Tensor,
         seqlen_info: SeqlenInfoQK,
         n_block: Int32,
     ) -> Int32:
         """For backward: find the first Q tile that can see this KV tile.
 
-        mKvSequsedK[j] = first Q index that can see KV position j.
+        mRowLimit[j] = first Q index that can see KV position j.
         """
         kv_idx = n_block * self.tile_n
-        first_q = mKvSequsedK[seqlen_info.offset_k + kv_idx]
+        first_q = mRowLimit[seqlen_info.offset_k + kv_idx]
         if const_expr(self.qhead_per_kvhead_packgqa > 1):
             first_q = first_q * self.qhead_per_kvhead_packgqa
         return first_q // self.tile_m
 
     @cute.jit
-    def get_m_block_max_kv_seqused_window(
+    def get_m_block_max_col_limit_window(
         self,
-        mKvSequsedK: cute.Tensor,
+        mRowLimit: cute.Tensor,
         seqlen_info: SeqlenInfoQK,
         n_block: Int32,
         window_size_left: Int32,
     ) -> Int32:
         """For backward with window: last Q tile that can still see this KV tile.
 
-        Q position i sees KV position j iff kv_seqused[i] - window_size_left <= j.
-        The first Q where the window has moved past j is kv_seqused_k[j + window_size_left].
-        Reuses kv_seqused_k with a shifted index — no new precomputation.
+        Q position i sees KV position j iff col_limit[i] - window_size_left <= j.
+        The first Q where the window has moved past j is row_limit[j + window_size_left].
+        Reuses row_limit with a shifted index — no new precomputation.
         """
         kv_end = cutlass.min((n_block + 1) * self.tile_n - 1, seqlen_info.seqlen_k - 1)
         shifted = cutlass.min(kv_end + window_size_left, seqlen_info.seqlen_k - 1)
-        last_q = mKvSequsedK[seqlen_info.offset_k + shifted]
+        last_q = mRowLimit[seqlen_info.offset_k + shifted]
         if const_expr(self.qhead_per_kvhead_packgqa > 1):
             last_q = last_q * self.qhead_per_kvhead_packgqa
         return cute.ceil_div(last_q, self.tile_m)

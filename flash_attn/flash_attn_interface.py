@@ -171,6 +171,7 @@ def _flash_attn_varlen_forward(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    col_limit: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
@@ -195,6 +196,7 @@ def _flash_attn_varlen_forward(
         softcap,
         return_softmax,
         None,
+        col_limit,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -222,6 +224,7 @@ def _flash_attn_varlen_forward_fake(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    col_limit: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     paged_kv = block_table is not None
@@ -366,6 +369,8 @@ def _flash_attn_varlen_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    col_limit: Optional[torch.Tensor] = None,
+    row_limit: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -399,6 +404,8 @@ def _flash_attn_varlen_backward(
         deterministic,
         None,
         rng_state,
+        col_limit,
+        row_limit,
     )
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
     #     breakpoint()
@@ -430,6 +437,8 @@ def _flash_attn_varlen_backward_fake(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    col_limit: Optional[torch.Tensor] = None,
+    row_limit: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     batch_size = cu_seqlens_q.numel() - 1
@@ -928,11 +937,36 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
         block_table,
+        col_limit,
+        row_limit,
         is_grad_enabled,
     ):
         is_grad = is_grad_enabled and any(
             x.requires_grad for x in [q, k, v]
         )
+        # Compute col_limit from row_limit if only row_limit is provided
+        if col_limit is None and row_limit is not None:
+            assert row_limit.dtype == torch.int32, "row_limit must have dtype int32"
+            batch_size = cu_seqlens_q.shape[0] - 1
+            col_limit = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+            for b in range(batch_size):
+                oq, ok = cu_seqlens_q[b].item(), cu_seqlens_k[b].item()
+                sq = cu_seqlens_q[b + 1].item() - oq
+                sk = cu_seqlens_k[b + 1].item() - ok
+                rl_batch = row_limit[ok:ok + sk]
+                targets = torch.arange(sq, dtype=torch.int32, device=q.device)
+                col_limit[oq:oq + sq] = torch.searchsorted(rl_batch, targets, side='right')
+        # Compute row_limit from col_limit if only col_limit is provided (needed for backward)
+        if row_limit is None and col_limit is not None:
+            batch_size = cu_seqlens_q.shape[0] - 1
+            row_limit = torch.empty(k.shape[0], dtype=torch.int32, device=q.device)
+            for b in range(batch_size):
+                oq, ok = cu_seqlens_q[b].item(), cu_seqlens_k[b].item()
+                sq = cu_seqlens_q[b + 1].item() - oq
+                sk = cu_seqlens_k[b + 1].item() - ok
+                cl_batch = col_limit[oq:oq + sq]
+                targets = torch.arange(1, sk + 1, dtype=torch.int32, device=q.device)
+                row_limit[ok:ok + sk] = torch.searchsorted(cl_batch, targets)
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_og = q.size(2)
@@ -957,6 +991,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
+            col_limit=col_limit,
         )
         if is_grad:
             ctx.save_for_backward(
@@ -971,6 +1006,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap = softcap
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
+            ctx.col_limit = col_limit
+            ctx.row_limit = row_limit
 
         out = out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
@@ -983,7 +1020,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dout_padded = dout
         if head_size_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-        _wrapped_flash_attn_varlen_backward(
+        # Call raw function directly (not torch.ops wrapper) to pass col_limit/row_limit
+        _flash_attn_varlen_backward(
             dout_padded,
             q,
             k,
@@ -1006,11 +1044,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
+            col_limit=ctx.col_limit,
+            row_limit=ctx.row_limit,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        # +1 None for row_limit
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -1402,6 +1443,8 @@ def flash_attn_varlen_func(
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
+    col_limit=None,
+    row_limit=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1475,6 +1518,8 @@ def flash_attn_varlen_func(
         deterministic,
         return_attn_probs,
         block_table,
+        col_limit,
+        row_limit,
         torch.is_grad_enabled(),
     )
 

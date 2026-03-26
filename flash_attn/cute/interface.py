@@ -316,7 +316,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
-    kv_seqused: Optional[torch.Tensor] = None,
+    col_limit: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -330,8 +330,8 @@ def _flash_attn_fwd(
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
-        kv_seqused: Optional (total_q,) int32 tensor for cross-attention release masking.
-            kv_seqused[i] = number of KV positions visible to Q position i.
+        col_limit: Optional (total_q,) int32 tensor for cross-attention release masking.
+            col_limit[i] = number of KV positions visible to Q position i.
             Must be monotonically non-decreasing within each batch.
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
@@ -394,13 +394,15 @@ def _flash_attn_fwd(
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
 
-    if kv_seqused is not None:
-        assert kv_seqused.shape == (total_q,), (
-            f"kv_seqused must have shape (total_q,)={total_q}, got {kv_seqused.shape}"
+    # row_limit → col_limit conversion is handled by the autograd wrapper (FlashAttnVarlenFunc).
+    # _flash_attn_fwd only receives col_limit.
+    if col_limit is not None:
+        assert col_limit.shape == (total_q,), (
+            f"col_limit must have shape (total_q,)={total_q}, got {col_limit.shape}"
         )
-        assert kv_seqused.dtype == torch.int32, "kv_seqused must be int32"
-        assert kv_seqused.stride(0) == 1, "kv_seqused must be contiguous"
-        assert not causal, "kv_seqused is incompatible with causal=True"
+        assert col_limit.dtype == torch.int32, "col_limit must be int32"
+        assert col_limit.stride(0) == 1, "col_limit must be contiguous"
+        assert not causal, "col_limit is incompatible with causal=True"
 
     if not is_fake_mode():
         assert all(
@@ -459,8 +461,8 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
-    # kv_seqused handles windowing itself; don't use the standard local masking path
-    if kv_seqused is not None:
+    # col_limit handles windowing itself; don't use the standard local masking path
+    if col_limit is not None:
         local = False
 
     # In fake mode (CPU-only compilation), use a fake stream placeholder.
@@ -637,7 +639,7 @@ def _flash_attn_fwd(
         mma_pv_is_rs,
         intra_wg_overlap,
         fa_logging.get_fa_log_level(),
-        kv_seqused is not None,
+        col_limit is not None,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -676,9 +678,9 @@ def _flash_attn_fwd(
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
-        kv_seqused_tensor = (
-            to_cute_tensor(kv_seqused, assumed_align=4, leading_dim=0)
-            if kv_seqused is not None
+        col_limit_tensor = (
+            to_cute_tensor(col_limit, assumed_align=4, leading_dim=0)
+            if col_limit is not None
             else None
         )
 
@@ -701,7 +703,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                has_kv_seqused=kv_seqused is not None,
+                has_col_limit=col_limit is not None,
             )
         elif arch // 10 == 9:
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
@@ -726,7 +728,7 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
-                has_kv_seqused=kv_seqused is not None,
+                has_col_limit=col_limit is not None,
             )
         elif arch // 10 in [10, 11]:
             fa_fwd = FlashAttentionForwardSm100(
@@ -752,7 +754,7 @@ def _flash_attn_fwd(
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
-                has_kv_seqused=kv_seqused is not None,
+                has_col_limit=col_limit is not None,
             )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -775,7 +777,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                has_kv_seqused=kv_seqused is not None,
+                has_col_limit=col_limit is not None,
             )
         else:
             raise ValueError(
@@ -801,12 +803,12 @@ def _flash_attn_fwd(
             sparse_tensors,
             cute_aux_tensors,
         ]
-        # SM80, SM90, SM100, SM110, SM120 kernels accept mKvSeqused (may be None)
+        # SM80, SM90, SM100, SM110, SM120 kernels accept mColLimit (may be None)
         if arch // 10 in [8, 9, 10, 11, 12]:
-            compile_args.append(kv_seqused_tensor)
-        elif kv_seqused is not None:
+            compile_args.append(col_limit_tensor)
+        elif col_limit is not None:
             raise ValueError(
-                f"kv_seqused is currently only supported on SM80/SM90/SM100/SM110/SM120, got arch={arch}"
+                f"col_limit is currently only supported on SM80/SM90/SM100/SM110/SM120, got arch={arch}"
             )
         compile_args.append(current_stream)
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
@@ -838,7 +840,7 @@ def _flash_attn_fwd(
             aux_tensors,
         ]
         if arch // 10 in [8, 9, 10, 11, 12]:
-            run_args.append(kv_seqused)
+            run_args.append(col_limit)
         _flash_attn_fwd.compile_cache[compile_key](*run_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -1030,7 +1032,8 @@ def _flash_attn_bwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
-    kv_seqused: Optional[torch.Tensor] = None,
+    col_limit: Optional[torch.Tensor] = None,
+    row_limit: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
@@ -1041,7 +1044,7 @@ def _flash_attn_bwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
-    if kv_seqused is not None:
+    if col_limit is not None:
         local = False
 
     if arch // 10 == 12:
@@ -1312,24 +1315,23 @@ def _flash_attn_bwd(
     if arch // 10 not in [9, 12]:
         num_threads = 384
 
-    # Precompute kv_seqused_k: for each KV position j, find first Q index that can see it
-    kv_seqused_k = None
-    if kv_seqused is not None:
+    # Precompute row_limit if not provided: for each KV position j, find first Q index that can see it
+    if row_limit is None and col_limit is not None:
         if cu_seqlens_q is not None and cu_seqlens_k is not None:
-            kv_seqused_k = torch.empty(k.shape[0], dtype=torch.int32, device=q.device)
+            row_limit = torch.empty(k.shape[0], dtype=torch.int32, device=q.device)
             batch_size_rm = cu_seqlens_q.shape[0] - 1
             for b in range(batch_size_rm):
                 oq, ok = cu_seqlens_q[b].item(), cu_seqlens_k[b].item()
                 sq, sk = cu_seqlens_q[b+1].item() - oq, cu_seqlens_k[b+1].item() - ok
-                rm_batch = kv_seqused[oq:oq+sq]
+                rm_batch = col_limit[oq:oq+sq]
                 # searchsorted: for each j in [0, sk), find first i where rm_batch[i] > j
                 targets = torch.arange(1, sk + 1, dtype=torch.int32, device=q.device)
-                kv_seqused_k[ok:ok+sk] = torch.searchsorted(rm_batch, targets)
+                row_limit[ok:ok+sk] = torch.searchsorted(rm_batch, targets)
         else:
             total_k_rm = k.shape[0] * k.shape[1] if cu_seqlens_k is None else k.shape[0]
-            kv_seqused_k = torch.empty(total_k_rm, dtype=torch.int32, device=q.device)
+            row_limit = torch.empty(total_k_rm, dtype=torch.int32, device=q.device)
             targets = torch.arange(1, total_k_rm + 1, dtype=torch.int32, device=q.device)
-            kv_seqused_k[:] = torch.searchsorted(kv_seqused, targets)
+            row_limit[:] = torch.searchsorted(col_limit, targets)
 
     # Backward kernel: compute dk, dv, dq_accum.
     score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
@@ -1392,7 +1394,7 @@ def _flash_attn_bwd(
             num_aux_tensors,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
-            kv_seqused is not None,
+            col_limit is not None,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
@@ -1422,7 +1424,7 @@ def _flash_attn_bwd(
             num_aux_tensors,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
-            kv_seqused is not None,
+            col_limit is not None,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,
@@ -1473,7 +1475,7 @@ def _flash_attn_bwd(
                 AtomLayoutNdKV,
                 AtomLayoutMdQ,
                 V_in_regs=V_in_regs,
-                has_kv_seqused=kv_seqused is not None,
+                has_col_limit=col_limit is not None,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
@@ -1503,7 +1505,7 @@ def _flash_attn_bwd(
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
                 dQ_single_wg=dQ_single_wg,
-                has_kv_seqused=kv_seqused is not None,
+                has_col_limit=col_limit is not None,
             )
         else:
             fa_bwd_obj = FlashAttentionBackwardSm100(
@@ -1522,7 +1524,7 @@ def _flash_attn_bwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
-                has_kv_seqused=kv_seqused is not None,
+                has_col_limit=col_limit is not None,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -1530,8 +1532,8 @@ def _flash_attn_bwd(
         if normalized_block_sparse_tensors is not None:
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
-        kv_seqused_tensor = to_cute_tensor(kv_seqused, assumed_align=4, leading_dim=0) if kv_seqused is not None else None
-        kv_seqused_k_tensor = to_cute_tensor(kv_seqused_k, assumed_align=4, leading_dim=0) if kv_seqused_k is not None else None
+        col_limit_tensor = to_cute_tensor(col_limit, assumed_align=4, leading_dim=0) if col_limit is not None else None
+        row_limit_tensor = to_cute_tensor(row_limit, assumed_align=4, leading_dim=0) if row_limit is not None else None
 
         # TODO: check @can_implement
         bwd_compile_args = [
@@ -1559,9 +1561,9 @@ def _flash_attn_bwd(
             cute_aux_tensors,
             sparse_tensors_compile,
         ]
-        # SM80, SM90, SM100, SM110, SM120 kernels accept mKvSeqused/mKvSequsedK (may be None)
+        # SM80, SM90, SM100, SM110, SM120 kernels accept mColLimit/mRowLimit (may be None)
         if arch // 10 in [8, 9, 10, 11, 12]:
-            bwd_compile_args.extend([kv_seqused_tensor, kv_seqused_k_tensor])
+            bwd_compile_args.extend([col_limit_tensor, row_limit_tensor])
         bwd_compile_args.append(current_stream)
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
             *bwd_compile_args,
@@ -1593,7 +1595,7 @@ def _flash_attn_bwd(
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
         ]
         if arch // 10 in [8, 9, 10, 11, 12]:
-            bwd_run_args.extend([kv_seqused, kv_seqused_k])
+            bwd_run_args.extend([col_limit, row_limit])
         _flash_attn_bwd.compile_cache[compile_key](*bwd_run_args)
 
     if arch // 10 == 9:
@@ -1746,8 +1748,38 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
-        kv_seqused: Optional[torch.Tensor] = None,
+        col_limit: Optional[torch.Tensor] = None,
+        row_limit: Optional[torch.Tensor] = None,
     ):
+        # Compute col_limit from row_limit if only row_limit is provided
+        if col_limit is None and row_limit is not None:
+            assert row_limit.dtype == torch.int32, "row_limit must be int32"
+            total_q = q.shape[0]
+            col_limit = torch.empty(total_q, dtype=torch.int32, device=q.device)
+            if cu_seqlens_q is not None and cu_seqlens_k is not None:
+                batch_size_rl = cu_seqlens_q.shape[0] - 1
+                for b in range(batch_size_rl):
+                    oq, ok = cu_seqlens_q[b].item(), cu_seqlens_k[b].item()
+                    sq = cu_seqlens_q[b + 1].item() - oq
+                    sk = cu_seqlens_k[b + 1].item() - ok
+                    rl_batch = row_limit[ok:ok + sk]
+                    targets = torch.arange(sq, dtype=torch.int32, device=q.device)
+                    col_limit[oq:oq + sq] = torch.searchsorted(rl_batch, targets, side='right')
+            else:
+                targets = torch.arange(total_q, dtype=torch.int32, device=q.device)
+                col_limit[:] = torch.searchsorted(row_limit, targets, side='right')
+        # Compute row_limit from col_limit if only col_limit is provided (needed for backward)
+        if row_limit is None and col_limit is not None:
+            if cu_seqlens_q is not None and cu_seqlens_k is not None:
+                row_limit = torch.empty(k.shape[0], dtype=torch.int32, device=q.device)
+                batch_size_rl = cu_seqlens_q.shape[0] - 1
+                for b in range(batch_size_rl):
+                    oq, ok = cu_seqlens_q[b].item(), cu_seqlens_k[b].item()
+                    sq = cu_seqlens_q[b + 1].item() - oq
+                    sk = cu_seqlens_k[b + 1].item() - ok
+                    cl_batch = col_limit[oq:oq + sq]
+                    targets = torch.arange(1, sk + 1, dtype=torch.int32, device=q.device)
+                    row_limit[ok:ok + sk] = torch.searchsorted(cl_batch, targets)
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -1770,7 +1802,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
-            kv_seqused=kv_seqused,
+            col_limit=col_limit,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -1781,7 +1813,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.return_lse = return_lse
-        ctx.kv_seqused = kv_seqused
+        ctx.col_limit = col_limit
+        ctx.row_limit = row_limit
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -1813,10 +1846,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_k=ctx.max_seqlen_k,
             deterministic=ctx.deterministic,
             dlse=dlse,
-            kv_seqused=ctx.kv_seqused,
+            col_limit=ctx.col_limit,
+            row_limit=ctx.row_limit,  # already computed in forward
         )
 
-        return dq, dk, dv, *((None,) * 21)
+        return dq, dk, dv, *((None,) * 22)
 
 
 def flash_attn_func(
@@ -1883,7 +1917,8 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
-    kv_seqused: Optional[torch.Tensor] = None,
+    col_limit: Optional[torch.Tensor] = None,
+    row_limit: Optional[torch.Tensor] = None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1907,7 +1942,8 @@ def flash_attn_varlen_func(
         score_mod,
         aux_tensors,
         return_lse,
-        kv_seqused,
+        col_limit,
+        row_limit,
     )
 
 

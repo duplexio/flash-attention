@@ -77,7 +77,7 @@ make_tiled_copy_C_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_first, bool Is_last, bool Seq_parallel=false, bool Has_col_limit=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -100,9 +100,27 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (n_block * kBlockN >= binfo.actual_seqlen_k) return;
 
+    // Pre-offset col_limit/row_limit pointers to be batch-local
+    const int * __restrict__ col_limit_batch = nullptr;
+    const int * __restrict__ row_limit_batch = nullptr;
+    if constexpr (Has_col_limit) {
+        const int q_offset = binfo.sum_s_q == -1 ? bidb * params.seqlen_q : binfo.sum_s_q;
+        const int k_offset = binfo.sum_s_k == -1 ? bidb * params.seqlen_k : binfo.sum_s_k;
+        col_limit_batch = params.col_limit + q_offset;
+        row_limit_batch = params.row_limit + k_offset;
+    }
+
     int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
     if (Is_local) {
         m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left, kBlockM));
+    }
+    if constexpr (Has_col_limit) {
+        // row_limit[j] = first Q index that can see KV position j.
+        // For this n_block, the last KV position is min((n_block+1)*kBlockN, seqlen_k) - 1.
+        // The last Q that could possibly attend to this block is seqlen_q (already m_block_max).
+        // The first Q that can see any position in this block is row_limit[n_block * kBlockN].
+        // We need m_block_max to cover all Q positions that see the last KV in this block.
+        // m_block_max is already ceil_div(seqlen_q, kBlockM), which is correct.
     }
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
@@ -318,19 +336,14 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     int m_block_min = (!Is_causal && !Is_local)
         ? 0
         : std::max(0, (n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k - params.window_size_right) / kBlockM);
-    // If not local, we're guaranteed that m_block_min <= m_block:
-    // We checked earlier that n_block * kBlockN < actual_seqlen_k, so in the causal case,
-    // n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k < actual_seqlen_q.
-    // So m_block_min <= (actual_seqlen_q - 1) / kBlockM.
-    // Recall that m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM) = (actual_seqlen_q + kBlockM - 1) / kBlockM.
-    // So m_block_m - 1 = (actual_seqlen_q - 1) / kBlockM.
-    // We conclude that m_block_min <= m_block, so we will always have at least 1 iteration of the for loop.
-    // However, if local, then this possible to have some blocks of K & V not attending to any query.
-    // We might need to exit early and write 0 to dK and dV for those blocks.
-    // Otherwise we get wrong result for the case where we don't enter the for loop.
-    // And we might read OOB elements from gQ and gdO.
-    // This also covers the case where actual_seqlen_q == 0
-    if ((Is_local || !Is_even_MN) && m_block < m_block_min) {
+    if constexpr (Has_col_limit) {
+        // row_limit[j] = first Q that can see KV position j.
+        // For this n_block, the first Q that can see any position in this block
+        // is row_limit[n_block * kBlockN] (since row_limit is non-decreasing).
+        const int first_kv = n_block * kBlockN;
+        m_block_min = std::max(m_block_min, row_limit_batch[first_kv] / kBlockM);
+    }
+    if ((Is_local || Has_col_limit || !Is_even_MN) && m_block < m_block_min) {
         const index_t row_offset_dk = binfo.k_offset(params.dk_batch_stride, params.dk_row_stride, bidb)
           + n_block * kBlockN * params.dk_row_stride + bidh * params.dk_head_stride;
         const index_t row_offset_dv = binfo.k_offset(params.dv_batch_stride, params.dv_row_stride, bidb)
@@ -501,22 +514,22 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // However, it's possible that the values in acc_s are so large that they overflow
         // when we multiply with dP and convert to fp16, resulting in Inf in dS and NaNs in dQ.
         // So we need to mask out the elements beyond actual_seqlen_k.
-        if (!Is_causal && !Is_local) {
+        if constexpr (Has_col_limit) {
+            FLASH_NAMESPACE::apply_mask_col_limit(scores,
+                n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                m_block * kBlockM + get<0>(taccScS_row(0)), AtomLayoutMS * 16,
+                binfo.actual_seqlen_q, col_limit_batch);
+        } else if (!Is_causal && !Is_local) {
             if (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k) {
                 FLASH_NAMESPACE::apply_mask(scores, binfo.actual_seqlen_k,
                                   n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16);
             }
         } else if (Is_causal) {
-            // Putting this causal masking right after acc_s is *much* slower for some reason.
-            // TD [2023-08-16]: We need the 2nd condition because if seqlen_q is long and seqlen_k is short
-            // (e.g., 256 and 2), the 2nd block of seqlen_q (from 128 to 255), we're not doing causal masking.
-            // But we still want to mask out elements beyond actual_seqlen_k.
             if (m_block * kBlockM < (n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k
                 || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k)) {
                 FLASH_NAMESPACE::apply_mask_causal(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                                          binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
                                          binfo.actual_seqlen_q,
-                                         // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
                                          AtomLayoutMS * 16);
             }
         } else if (Is_local) {
@@ -823,7 +836,7 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Has_col_limit=false, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // The block index for the batch.
@@ -833,7 +846,7 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
     for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true, Has_col_limit>(params, bidb, bidh, n_block);
     }
 }
 

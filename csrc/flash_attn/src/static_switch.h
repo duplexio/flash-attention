@@ -76,6 +76,8 @@
   #define LOCAL_SWITCH BOOL_SWITCH
 #endif
 
+#define COL_LIMIT_SWITCH BOOL_SWITCH
+
 #define FP16_SWITCH(COND, ...)               \
   [&] {                                      \
     if (COND) {                              \

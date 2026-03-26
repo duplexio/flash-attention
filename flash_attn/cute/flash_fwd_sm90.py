@@ -172,7 +172,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
-        mKvSeqused: Optional[cute.Tensor] = None,  # (total_q,) int32
+        mColLimit: Optional[cute.Tensor] = None,  # (total_q,) int32
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -391,7 +391,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             SharedStorage,
             aux_tensors,
             fastdiv_mods,
-            mKvSeqused,
+            mColLimit,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -438,7 +438,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr[Callable],
         aux_tensors=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
-        mKvSeqused: Optional[cute.Tensor] = None,
+        mColLimit: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -545,7 +545,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-            has_kv_seqused=self.has_kv_seqused,
+            has_col_limit=self.has_col_limit,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -566,7 +566,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             window_size_left=window_size_left,
             window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-            kv_seqused=mKvSeqused,
+            col_limit=mColLimit,
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
@@ -594,7 +594,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
-                mKvSeqused,
+                mColLimit,
             )
 
         else:  # Consumer
@@ -630,7 +630,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 blocksparse_tensors,
                 aux_tensors,
                 fastdiv_mods,
-                mKvSeqused,
+                mColLimit,
             )
 
     @cute.jit
@@ -654,7 +654,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
-        mKvSeqused: Optional[cute.Tensor] = None,
+        mColLimit: Optional[cute.Tensor] = None,
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tidx, _, _ = cute.arch.thread_idx()
@@ -762,12 +762,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     )
 
                 if const_expr(not self.use_block_sparsity):
-                    if const_expr(not self.has_kv_seqused):
+                    if const_expr(not self.has_col_limit):
                         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
                     else:
                         n_block_min = Int32(0)
-                        n_block_max = block_info.get_n_block_max_kv_seqused(
-                            mKvSeqused, seqlen, m_block
+                        n_block_max = block_info.get_n_block_max_col_limit(
+                            mColLimit, seqlen, m_block
                         )
                         n_block_max = cutlass.min(
                             n_block_max, cute.ceil_div(seqlen.seqlen_k, self.tile_n)
@@ -966,7 +966,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors],
         aux_tensors: Optional[list],
         fastdiv_mods=None,
-        mKvSeqused: Optional[cute.Tensor] = None,
+        mColLimit: Optional[cute.Tensor] = None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
@@ -1075,7 +1075,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
             mask = AttentionMaskCls(
                 seqlen,
-                offset_q=seqlen.offset_q if const_expr(self.has_kv_seqused) else 0,
+                offset_q=seqlen.offset_q if const_expr(self.has_col_limit) else 0,
             )
             mask_fn = partial(
                 mask.apply_mask,
@@ -1085,7 +1085,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 thr_mma=thr_mma_qk,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
-                mask_kv_seqused=self.has_kv_seqused,
+                mask_col_limit=self.has_col_limit,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
             )
@@ -1104,12 +1104,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mma_one_n_block = partial(
                 mma_one_n_block_all, seqlen=seqlen, softmax=softmax, score_mod_fn=score_mod_fn
             )
-            if const_expr(not self.has_kv_seqused):
+            if const_expr(not self.has_col_limit):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             else:
                 n_block_min = Int32(0)
-                n_block_max = block_info.get_n_block_max_kv_seqused(
-                    mKvSeqused, seqlen, m_block
+                n_block_max = block_info.get_n_block_max_col_limit(
+                    mColLimit, seqlen, m_block
                 )
                 # Clamp to actual seqlen_k
                 n_block_max = cutlass.min(n_block_max, cute.ceil_div(seqlen.seqlen_k, self.tile_n))
@@ -1169,12 +1169,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         O_should_accumulate = True
                     n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
                 # Next couple of iterations with release mask masking
-                if const_expr(self.has_kv_seqused):
-                    n_block_min_kv_seqused = block_info.get_n_block_min_kv_seqused_mask(
-                        mKvSeqused, seqlen, m_block, n_block_min
+                if const_expr(self.has_col_limit):
+                    n_block_min_col_limit = block_info.get_n_block_min_col_limit_mask(
+                        mColLimit, seqlen, m_block, n_block_min
                     )
                     for n_tile in cutlass.range(
-                        n_block_max - n_block_min_kv_seqused, unroll=1
+                        n_block_max - n_block_min_col_limit, unroll=1
                     ):
                         kv_consumer_state = mma_one_n_block(
                             kv_consumer_state,
@@ -1184,7 +1184,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                         )
                         O_should_accumulate = True
-                    n_block_max = cutlass.min(n_block_max, n_block_min_kv_seqused)
+                    n_block_max = cutlass.min(n_block_max, n_block_min_col_limit)
                 # The remaining iterations have no masking
                 n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
                     seqlen, m_block, n_block_min

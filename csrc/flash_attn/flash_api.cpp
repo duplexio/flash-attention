@@ -86,6 +86,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
     params.seqused_k = static_cast<int *>(seqused_k);
+    params.col_limit = nullptr;  // set by caller if needed
 
     // P = softmax(QK^T)
     params.p_ptr = p_d;
@@ -238,6 +239,7 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.dsoftmax_sum = dsoftmax_sum_d;
 
     params.deterministic = deterministic;
+    params.row_limit = nullptr;
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
@@ -532,7 +534,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_right,
                const float softcap,
                const bool return_softmax,
-               std::optional<at::Generator> gen_) {
+               std::optional<at::Generator> gen_,
+               std::optional<at::Tensor> &col_limit_) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -628,6 +631,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         TORCH_CHECK(seqused_k_.is_contiguous(), "seqused_k must be contiguous");
         CHECK_SHAPE(seqused_k_, batch_size);
     }
+    if (col_limit_.has_value()){
+        auto col_limit = col_limit_.value();
+        TORCH_CHECK(col_limit.dtype() == torch::kInt32, "col_limit must have dtype int32");
+        TORCH_CHECK(col_limit.is_cuda(), "col_limit must be on CUDA device");
+        TORCH_CHECK(col_limit.is_contiguous(), "col_limit must be contiguous");
+        TORCH_CHECK(!is_causal, "col_limit cannot be used with causal=True");
+        CHECK_SHAPE(col_limit, sizes[0]);  // total_q
+    }
 
     at::Tensor out;
     if (out_.has_value()) {
@@ -687,6 +698,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      seqlenq_ngroups_swapped,
                      /*unpadded_lse*/true);
     params.total_q = total_q;
+    params.col_limit = col_limit_.has_value()
+        ? static_cast<int *>(col_limit_.value().data_ptr()) : nullptr;
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
@@ -994,7 +1007,9 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const float softcap,
                const bool deterministic,
                std::optional<at::Generator> gen_,
-               std::optional<at::Tensor> &rng_state) {
+               std::optional<at::Tensor> &rng_state,
+               std::optional<at::Tensor> &col_limit_,
+               std::optional<at::Tensor> &row_limit_) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -1159,6 +1174,10 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      /*unpadded_lse*/true);
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
     params.total_q = total_q;
+    params.col_limit = col_limit_.has_value()
+        ? static_cast<int *>(col_limit_.value().data_ptr()) : nullptr;
+    params.row_limit = row_limit_.has_value()
+        ? static_cast<int *>(row_limit_.value().data_ptr()) : nullptr;
 
     auto launch = &run_mha_bwd;
 

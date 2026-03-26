@@ -46,7 +46,7 @@ class FlashAttentionBackwardSm80:
         AtomLayoutNdKV: int = 8,
         AtomLayoutMdQ: int = 1,
         V_in_regs: bool = False,
-        has_kv_seqused: bool = False,
+        has_col_limit: bool = False,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -79,7 +79,7 @@ class FlashAttentionBackwardSm80:
         self.num_threads = num_threads
         self.pack_gqa = pack_gqa
         self.is_causal = is_causal
-        self.has_kv_seqused = has_kv_seqused
+        self.has_col_limit = has_col_limit
         self.num_stages_Q = num_stages_Q
         self.num_stages_dO = num_stages_dO
         self.SdP_swapAB = SdP_swapAB
@@ -387,8 +387,8 @@ class FlashAttentionBackwardSm80:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        mKvSeqused: Optional[cute.Tensor] = None,
-        mKvSequsedK: Optional[cute.Tensor] = None,
+        mColLimit: Optional[cute.Tensor] = None,
+        mRowLimit: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -471,8 +471,8 @@ class FlashAttentionBackwardSm80:
             SharedStorage,
             tile_sched_params,
             TileScheduler,
-            mKvSeqused,
-            mKvSequsedK,
+            mColLimit,
+            mRowLimit,
             window_size_left,
         ).launch(
             grid=grid_dim,
@@ -518,8 +518,8 @@ class FlashAttentionBackwardSm80:
         SharedStorage: cutlass.Constexpr,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
-        mKvSeqused: Optional[cute.Tensor] = None,
-        mKvSequsedK: Optional[cute.Tensor] = None,
+        mColLimit: Optional[cute.Tensor] = None,
+        mRowLimit: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
     ):
         # Thread index, block index
@@ -550,14 +550,14 @@ class FlashAttentionBackwardSm80:
                     (n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k) // self.m_block_size,
                     m_block_min,
                 )
-            if cutlass.const_expr(self.has_kv_seqused):
+            if cutlass.const_expr(self.has_col_limit):
                 kv_idx = n_block * self.n_block_size
-                first_q = mKvSequsedK[seqlen.offset_k + kv_idx]
+                first_q = mRowLimit[seqlen.offset_k + kv_idx]
                 m_block_min = max(first_q // self.m_block_size, m_block_min)
                 if cutlass.const_expr(window_size_left is not None):
                     kv_end = cutlass.min((n_block + 1) * self.n_block_size - 1, seqlen.seqlen_k - 1)
                     shifted = cutlass.min(kv_end + window_size_left, seqlen.seqlen_k - 1)
-                    last_q = mKvSequsedK[seqlen.offset_k + shifted]
+                    last_q = mRowLimit[seqlen.offset_k + shifted]
                     m_block_max = cutlass.min(m_block_max, cute.ceil_div(last_q, self.m_block_size))
             # TODO: return early if m_block_max == 0
 
@@ -835,14 +835,14 @@ class FlashAttentionBackwardSm80:
             mask = AttentionMask(
                 self.m_block_size, self.n_block_size, seqlen,
                 window_size_left=window_size_left,
-                kv_seqused=mKvSeqused,
-                offset_q=seqlen.offset_q if cutlass.const_expr(self.has_kv_seqused) else 0,
+                col_limit=mColLimit,
+                offset_q=seqlen.offset_q if cutlass.const_expr(self.has_col_limit) else 0,
             )
             mask_fn = partial(
                 mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
                 batch_idx=batch_idx, head_idx=head_idx,
                 mask_seqlen=True, mask_causal=self.is_causal,
-                mask_kv_seqused=self.has_kv_seqused,
+                mask_col_limit=self.has_col_limit,
             )
             smem_pipe_read_q = cutlass.Int32(0)
             smem_pipe_read_do = cutlass.Int32(0)
