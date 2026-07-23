@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from flash_attn.cute.interface import (
     _flash_attn_fwd,
     _flash_attn_bwd,
+    _tile_size_fwd_sm90,
     flash_attn_func,
 )
 from flash_attn.cute.block_sparsity import (
@@ -47,6 +48,31 @@ from mask_mod_definitions import (
     make_packed_mask_aux_tensor,
 )
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+
+
+@pytest.mark.parametrize(
+    "sparse_block_size_kv,expected_tile_n",
+    [(None, 80), (64, 64), (80, 80)],
+)
+def test_sm90_hd256_forward_tile_honors_sparse_kv_block_size(
+    sparse_block_size_kv,
+    expected_tile_n,
+):
+    config = _tile_size_fwd_sm90(
+        head_dim=256,
+        head_dim_v=256,
+        is_causal=False,
+        is_local=False,
+        sparse_block_size_q=128,
+        sparse_block_size_kv=sparse_block_size_kv,
+    )
+
+    assert (
+        config.m_block_size,
+        config.n_block_size,
+        config.mma_pv_is_rs,
+        config.intra_wg_overlap,
+    ) == (128, expected_tile_n, True, True)
 
 
 @cute.jit

@@ -122,7 +122,14 @@ class FwdConfig:
     intra_wg_overlap: bool
 
 
-def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_size_q=None):
+def _tile_size_fwd_sm90(
+    head_dim,
+    head_dim_v,
+    is_causal,
+    is_local,
+    sparse_block_size_q=None,
+    sparse_block_size_kv=None,
+):
     """Return FwdConfig for SM90 forward.
 
     Tile sizes and flags based on tile_size_fwd_sm90 in hopper/tile_size.h, adjusted
@@ -130,6 +137,8 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
 
     When sparse_block_size_q is set, tile_m must divide it. For head_dim <= 96 the
     optimal tile_m=192 is used when compatible, otherwise we fall back to 128.
+    For head_dim 256, either supported tile_n may be selected to match explicit
+    sparse KV metadata.
     """
     if head_dim <= 64:
         # C++: 192×192 non-causal, 192×128 causal/local.
@@ -154,6 +163,8 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
         return FwdConfig(128, tile_n, True, True)
     else:  # hdim 256
         tile_n = 64 if is_local else 80
+        if sparse_block_size_kv in (64, 80):
+            tile_n = sparse_block_size_kv
         return FwdConfig(128, tile_n, True, True)
 
 @dataclass(frozen=True)
@@ -539,7 +550,20 @@ def _flash_attn_fwd(
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
             sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
-            fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q)
+            sparse_kv = (
+                block_sparse_tensors.block_size[1]
+                if block_sparse_tensors is not None
+                and block_sparse_tensors.block_size is not None
+                else None
+            )
+            fwd_cfg = _tile_size_fwd_sm90(
+                head_dim,
+                head_dim_v,
+                causal,
+                local,
+                sparse_block_size_q=sparse_q,
+                sparse_block_size_kv=sparse_kv,
+            )
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
